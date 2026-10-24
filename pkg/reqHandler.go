@@ -535,7 +535,15 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 			if err != nil {
 				if errors.Is(err, errPayloadTooLarge) {
 					log.Printf("Payload exceeds the allowed limit: %v", err)
-					http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
+					details := buildLogDetails(r, ua, payload, false)
+					details["payload_too_large"] = "true"
+					details["content_length"] = strconv.FormatInt(r.ContentLength, 10)
+					logDetails(details)
+					if fallback != nil {
+						writeTrapResponse(w, r, Behaviour{Response: fallback.TooLarge})
+					} else {
+						http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
+					}
 					return
 				}
 				log.Printf("Error processing payload: %v", err)

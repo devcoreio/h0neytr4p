@@ -674,3 +674,90 @@ func TestAllHandlerCapturesMultipartPayloadFile(t *testing.T) {
 		t.Fatalf("log does not include multipart field: %s", logContent)
 	}
 }
+
+func oversizedMultipartRequest(t *testing.T, path string, size int) (*http.Request, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormField("blob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(bytes.Repeat([]byte("A"), size)); err != nil {
+		t.Fatal(err)
+	}
+	_ = mw.Close()
+	req := httptest.NewRequest(http.MethodPost, path, &buf)
+	req.RemoteAddr = "192.168.50.20:54321"
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	return req, mw.Boundary()
+}
+
+func TestAllHandlerLogsOversizedPayload(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+
+	req, _ := oversizedMultipartRequest(t, "/upload", 150*1024)
+	req.ContentLength = 153600
+	req.Header.Set("Content-Length", "153600")
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if rec.Header().Get("Server") == "" {
+		t.Fatal("Server header missing on 413")
+	}
+	if !strings.Contains(rec.Body.String(), "Request Entity Too Large") {
+		t.Fatalf("body = %q, want Apache-style 413 page", rec.Body.String())
+	}
+	logContent := readTestLog(t, logPath)
+	for _, want := range []string{`"payload_too_large":"true"`, `"content_length":"153600"`, `"request_uri":"/upload"`, `"src_ip":"192.168.50.20"`} {
+		if !strings.Contains(logContent, want) {
+			t.Fatalf("log missing %s: %s", want, logContent)
+		}
+	}
+}
+
+func TestAllHandlerOversizedWithoutFallbackStill413(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(nil)
+
+	req, _ := oversizedMultipartRequest(t, "/upload", 150*1024)
+	req.ContentLength = 153600
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if !strings.Contains(readTestLog(t, logPath), `"payload_too_large":"true"`) {
+		t.Fatal("oversized request without fallback was not logged")
+	}
+}
+
+func TestAllHandlerChunkedOversizedMultipartIsLoggedNot500(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+
+	req, _ := oversizedMultipartRequest(t, "/upload", 110*1024)
+	req.ContentLength = -1
+	req.Header.Del("Content-Length")
+	req.TransferEncoding = []string{"chunked"}
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 from fallback.Unmatched", rec.Code)
+	}
+	logContent := readTestLog(t, logPath)
+	if entries := strings.Count(strings.TrimSpace(logContent), "\n") + 1; entries != 1 {
+		t.Fatalf("log entries = %d, want 1: %s", entries, logContent)
+	}
+	if !strings.Contains(logContent, `"trapped":"false"`) {
+		t.Fatalf("chunked oversized request not logged as trapped=false: %s", logContent)
+	}
+}
