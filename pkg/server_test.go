@@ -53,14 +53,32 @@ func TestServerHeadMatchesGetTrap(t *testing.T) {
 	if resp.Header.Get("Server") != "Apache/2.4.58 (Ubuntu)" {
 		t.Fatalf("HEAD Server header = %q", resp.Header.Get("Server"))
 	}
-	if want := strconv.Itoa(len(loginTrap().Behaviour[0].Response.Body)); resp.Header.Get("Content-Length") != want {
-		t.Fatalf("HEAD Content-Length = %q, want %q", resp.Header.Get("Content-Length"), want)
+	// Apache sends no Content-Length on HEAD for dynamic pages and error
+	// documents; only static assets (traps that set it explicitly) carry one.
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		t.Fatalf("HEAD Content-Length = %q, want none when the trap sets none", cl)
 	}
 	if len(body) != 0 {
 		t.Fatalf("HEAD body length = %d, want 0", len(body))
 	}
 	if !strings.Contains(readTestLog(t, logPath), `"trapped_for":"moodle"`) {
 		t.Fatal("HEAD was not logged against the GET trap")
+	}
+}
+
+func TestServerHeadKeepsExplicitContentLength(t *testing.T) {
+	configureTestIO(t)
+	trap := loginTrap()
+	trap.Behaviour[0].Response.Headers["Content-Length"] = strconv.Itoa(len(trap.Behaviour[0].Response.Body))
+	srv := startServer(t, []Trap{trap})
+
+	resp, err := http.Head(srv.URL + "/login/index.php")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if want := strconv.Itoa(len(trap.Behaviour[0].Response.Body)); resp.Header.Get("Content-Length") != want {
+		t.Fatalf("HEAD Content-Length = %q, want explicit %q", resp.Header.Get("Content-Length"), want)
 	}
 }
 

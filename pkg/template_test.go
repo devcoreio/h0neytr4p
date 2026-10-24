@@ -87,3 +87,46 @@ func TestFileResponseIsRendered(t *testing.T) {
 		t.Fatalf("file body not rendered: %q", rec.Body.String())
 	}
 }
+
+func TestRenderRequestTokens(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://learn.wexmoor.institute:8443/phpinfo.php", nil)
+	req.Host = "learn.wexmoor.institute:8443"
+	req.RemoteAddr = "203.0.113.9:51234"
+	req.Header.Set("User-Agent", "Mozilla/5.0 <x>")
+	req.Header.Set("Accept", "text/html")
+
+	got := RenderRequestTemplate("{{req_host}}|{{req_port}}|{{req_ip}}|{{req_remote_port}}|{{req_ua}}|{{req_accept}}", req)
+	want := "learn.wexmoor.institute|8443|203.0.113.9|51234|Mozilla/5.0 &lt;x&gt;|text/html"
+	if got != want {
+		t.Fatalf("request tokens = %q, want %q", got, want)
+	}
+	if got := RenderRequestTemplate("{{req_time}}", req); !regexp.MustCompile(`^1[0-9]{9}$`).MatchString(got) {
+		t.Fatalf("req_time = %q", got)
+	}
+	if got := RenderRequestTemplate("{{req_time_float}}", req); !regexp.MustCompile(`^1[0-9]{9}\.[0-9]{4}$`).MatchString(got) {
+		t.Fatalf("req_time_float = %q", got)
+	}
+}
+
+func TestRenderRequestTokensWithoutHostHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Host = ""
+	req.RemoteAddr = "203.0.113.9:51234"
+	got := RenderRequestTemplate("{{req_host}}:{{req_port}}", req)
+	if got != "203.0.113.9:80" && got != ":80" {
+		t.Fatalf("hostless request tokens = %q", got)
+	}
+}
+
+func TestWriteTrapResponseRendersRequestTokensInBody(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nope", nil)
+	req.Host = "203.0.113.50"
+	writeTrapResponse(rec, req, Behaviour{Response: Response{
+		Statuscode: 404, Type: "string", Body: "<address>Apache Server at {{req_host}} Port {{req_port}}</address>",
+		Headers: map[string]interface{}{"Content-Type": "text/html"},
+	}})
+	if want := "<address>Apache Server at 203.0.113.50 Port 80</address>"; rec.Body.String() != want {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), want)
+	}
+}

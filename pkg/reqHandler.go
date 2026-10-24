@@ -516,27 +516,27 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 		body = []byte(behaviour.Response.Body)
 	}
 
+	render := func(s string) string { return RenderTemplate(RenderRequestTemplate(s, r)) }
 	if bytes.Contains(body, []byte("{{")) {
-		body = []byte(RenderTemplate(string(body)))
+		body = []byte(render(string(body)))
 	}
 	for key, value := range convertMap(behaviour.Response.Headers) {
 		if strings.EqualFold(key, "Set-Cookie-If-Missing") {
 			name, _, _ := strings.Cut(value, "=")
 			if r != nil && !requestHasCookie(r, strings.TrimSpace(name)) {
-				w.Header().Add("Set-Cookie", RenderTemplate(value))
+				w.Header().Add("Set-Cookie", render(value))
 			}
 			continue
 		}
-		w.Header().Set(key, RenderTemplate(value))
+		w.Header().Set(key, render(value))
 	}
 	statusCode := behaviour.Response.Statuscode
 	if statusCode == 0 {
 		statusCode = http.StatusOK
 	}
-	if r != nil && r.Method == http.MethodHead && w.Header().Get("Content-Length") == "" {
-		// Like Apache: HEAD advertises the body length without sending it.
-		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	}
+	// HEAD sends no body. Content-Length is only advertised when the trap sets
+	// it explicitly (static assets); Apache omits it for dynamic pages and
+	// error documents, and so does Go when nothing is written.
 	w.WriteHeader(statusCode)
 	if r != nil && r.Method == http.MethodHead {
 		return
