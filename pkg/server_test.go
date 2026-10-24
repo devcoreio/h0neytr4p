@@ -163,3 +163,15 @@ func TestServerChunkedOversizedMultipartIs413WithFlag(t *testing.T) {
 		t.Fatalf("chunked oversized multipart not flagged: %s", logContent)
 	}
 }
+
+func TestNewServerDisablesHTTP2(t *testing.T) {
+	srv := newServer("443", http.NotFoundHandler())
+	// An empty, non-nil TLSNextProto map is net/http's documented switch for
+	// turning HTTP/2 off; stock Ubuntu Apache does not speak h2.
+	if srv.TLSNextProto == nil || len(srv.TLSNextProto) != 0 {
+		t.Fatalf("TLSNextProto = %v, want empty non-nil map (HTTP/2 disabled)", srv.TLSNextProto)
+	}
+	if srv.Addr != ":443" {
+		t.Fatalf("Addr = %q", srv.Addr)
+	}
+}

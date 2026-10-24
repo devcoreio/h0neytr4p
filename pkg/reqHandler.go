@@ -3,6 +3,7 @@ package h0neytr4p
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -626,18 +627,26 @@ func newTrapRouter(trapConfig []Trap, catchall bool) *mux.Router {
 	return r
 }
 
-func StartHandler(port string, trapConfig []Trap, cert string, key string, catchall bool) error {
-	r := newTrapRouter(trapConfig, catchall)
-	fmt.Println("[~>] Loaded " + strconv.Itoa(len(trapConfig)) + " trap(s) on Port:" + port + ". Let's get the ball rolling!")
-
-	server := &http.Server{
+// newServer builds the listener for one port. HTTP/2 is disabled: the persona
+// is a stock Ubuntu Apache, which does not enable mod_http2, and Go would
+// otherwise advertise h2 in the TLS ALPN.
+func newServer(port string, handler http.Handler) *http.Server {
+	return &http.Server{
 		Addr:              ":" + port,
-		Handler:           r,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		TLSNextProto:      map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
+}
+
+func StartHandler(port string, trapConfig []Trap, cert string, key string, catchall bool) error {
+	r := newTrapRouter(trapConfig, catchall)
+	fmt.Println("[~>] Loaded " + strconv.Itoa(len(trapConfig)) + " trap(s) on Port:" + port + ". Let's get the ball rolling!")
+
+	server := newServer(port, r)
 
 	var err error
 	if port == "443" {
