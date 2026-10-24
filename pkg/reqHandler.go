@@ -502,8 +502,18 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 		body = []byte(behaviour.Response.Body)
 	}
 
+	if bytes.Contains(body, []byte("{{")) {
+		body = []byte(RenderTemplate(string(body)))
+	}
 	for key, value := range convertMap(behaviour.Response.Headers) {
-		w.Header().Set(key, value)
+		if strings.EqualFold(key, "Set-Cookie-If-Missing") {
+			name, _, _ := strings.Cut(value, "=")
+			if r != nil && !requestHasCookie(r, strings.TrimSpace(name)) {
+				w.Header().Add("Set-Cookie", RenderTemplate(value))
+			}
+			continue
+		}
+		w.Header().Set(key, RenderTemplate(value))
 	}
 	statusCode := behaviour.Response.Statuscode
 	if statusCode == 0 {
