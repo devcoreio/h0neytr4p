@@ -43,13 +43,32 @@ func readTestLog(t *testing.T, logPath string) string {
 	return string(content)
 }
 
-func TestGetIPUsesFirstForwardedForAddress(t *testing.T) {
+func TestGetIPIgnoresForwardedFor(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "192.168.50.20:54321"
 	req.Header.Set("X-Forwarded-For", "10.0.0.5, 10.1.0.15, 10.2.0.14")
 
-	if got, want := GetIP(req), "10.0.0.5"; got != want {
+	if got, want := GetIP(req), "192.168.50.20"; got != want {
 		t.Fatalf("GetIP() = %q, want %q", got, want)
+	}
+}
+
+func TestAllHandlerLogsForwardedForHeader(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.RemoteAddr = "192.168.50.20:54321"
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	rec := httptest.NewRecorder()
+
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"header_x-forwarded-for":"203.0.113.7"`) {
+		t.Fatalf("log does not keep X-Forwarded-For as a header: %s", logContent)
+	}
+	if !strings.Contains(logContent, `"src_ip":"192.168.50.20"`) {
+		t.Fatalf("log src_ip is not the RemoteAddr host: %s", logContent)
 	}
 }
 

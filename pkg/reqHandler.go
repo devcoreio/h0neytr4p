@@ -159,12 +159,10 @@ func GetHostname(r *http.Request) string {
 	return strings.Trim(host, "[]")
 }
 
+// GetIP returns the peer address of the TCP connection. X-Forwarded-For is
+// deliberately ignored: this honeypot is never behind a trusted proxy and the
+// header is attacker-controlled. It is still logged as header_x-forwarded-for.
 func GetIP(r *http.Request) string {
-	forwarded := r.Header.Get("X-Forwarded-For")
-	if forwarded != "" {
-		ip, _, _ := strings.Cut(forwarded, ",")
-		return strings.TrimSpace(ip)
-	}
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {
 		return ip
