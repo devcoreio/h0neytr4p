@@ -100,3 +100,31 @@ func TestAllHandlerUnmatchedWithoutFallbackIsLegacy(t *testing.T) {
 		t.Fatalf("legacy unmatched = %d %q, want empty 200", rec.Code, rec.Body.String())
 	}
 }
+
+func writeFallbackFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fallback.json")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadFallbackRejectsBadFiles(t *testing.T) {
+	t.Cleanup(func() { SetFallback(nil) })
+	ok := `"StatusCode": 404, "Body": "x", "Type": "string", "Headers": {"Content-Type": "text/html"}`
+	cases := map[string]string{
+		"missing body file":     `{"Unmatched": {"StatusCode": 404, "Body": "/nonexistent/404.html", "Type": "file", "Headers": {"Content-Type": "text/html"}}, "TooLarge": {` + ok + `}}`,
+		"missing TooLarge":      `{"Unmatched": {` + ok + `}}`,
+		"zero status":           `{"Unmatched": {"StatusCode": 0, "Body": "x", "Type": "string", "Headers": {"Content-Type": "text/html"}}, "TooLarge": {` + ok + `}}`,
+		"no Content-Type":       `{"Unmatched": {"StatusCode": 404, "Body": "x", "Type": "string", "Headers": {"Server": "x"}}, "TooLarge": {` + ok + `}}`,
+		"unknown top-level key": `{"Unmatch": {` + ok + `}, "TooLarge": {` + ok + `}}`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadFallback(writeFallbackFile(t, content)); err == nil {
+				t.Fatalf("LoadFallback accepted a fallback with %s", name)
+			}
+		})
+	}
+}

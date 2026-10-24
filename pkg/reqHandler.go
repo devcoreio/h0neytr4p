@@ -338,6 +338,10 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 	case "multipart/form-data":
 		r.Body = http.MaxBytesReader(w, r.Body, sizeLimit)
 		if err := r.ParseMultipartForm(sizeLimit); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				return payload, fmt.Errorf("%w: multipart body exceeds %d bytes", errPayloadTooLarge, sizeLimit)
+			}
 			return payload, fmt.Errorf("parse multipart form: %w", err)
 		}
 		if r.MultipartForm == nil {
@@ -412,10 +416,20 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 	return payload, nil
 }
 
+// methodMatches compares a trap's Method with the request's. HEAD is served
+// by GET behaviours (as Apache and net/http do) unless a HEAD-specific
+// behaviour appears earlier in trap order.
+func methodMatches(ruleMethod string, requestMethod string) bool {
+	if ruleMethod == requestMethod {
+		return true
+	}
+	return requestMethod == http.MethodHead && ruleMethod == http.MethodGet
+}
+
 func hasMatchingRequest(trapConfig []Trap, method string, path string) bool {
 	for _, trap := range trapConfig {
 		for _, behaviour := range trap.Behaviour {
-			if behaviour.Request.Method == method && match(behaviour.Request.URL, path) {
+			if methodMatches(behaviour.Request.Method, method) && match(behaviour.Request.URL, path) {
 				return true
 			}
 		}
@@ -547,7 +561,11 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 					log.Printf("Payload exceeds the allowed limit: %v", err)
 					details := buildLogDetails(r, ua, payload, false)
 					details["payload_too_large"] = "true"
-					details["content_length"] = strconv.FormatInt(r.ContentLength, 10)
+					if r.ContentLength < 0 {
+						details["content_length"] = "chunked"
+					} else {
+						details["content_length"] = strconv.FormatInt(r.ContentLength, 10)
+					}
 					logDetails(details)
 					if fallback != nil {
 						writeTrapResponse(w, r, Behaviour{Response: fallback.TooLarge})
@@ -562,7 +580,7 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 
 		for _, trap := range trapConfig {
 			for _, behaviour := range trap.Behaviour {
-				if behaviour.Request.Method != r.Method || !match(behaviour.Request.URL, r.URL.Path) {
+				if !methodMatches(behaviour.Request.Method, r.Method) || !match(behaviour.Request.URL, r.URL.Path) {
 					continue
 				}
 
@@ -598,7 +616,13 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 func newTrapRouter(trapConfig []Trap, catchall bool) *mux.Router {
 	r := mux.NewRouter()
 	r.SkipClean(true)
-	r.PathPrefix("/").Handler(allHandler(trapConfig, catchall))
+	handler := allHandler(trapConfig, catchall)
+	r.PathPrefix("/").Handler(handler)
+	// CONNECT has an empty URL.Path and never matches PathPrefix("/"); route
+	// mux's own 404/405 to the honeypot so no request is unlogged or answered
+	// by mux's Go-flavoured text/plain page.
+	r.NotFoundHandler = handler
+	r.MethodNotAllowedHandler = handler
 	return r
 }
 

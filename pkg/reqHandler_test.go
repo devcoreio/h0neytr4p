@@ -738,7 +738,7 @@ func TestAllHandlerOversizedWithoutFallbackStill413(t *testing.T) {
 	}
 }
 
-func TestAllHandlerChunkedOversizedMultipartIsLoggedNot500(t *testing.T) {
+func TestAllHandlerChunkedOversizedMultipartIs413WithFlag(t *testing.T) {
 	logPath, _ := configureTestIO(t)
 	SetFallback(testFallback())
 	t.Cleanup(func() { SetFallback(nil) })
@@ -750,14 +750,16 @@ func TestAllHandlerChunkedOversizedMultipartIsLoggedNot500(t *testing.T) {
 	rec := httptest.NewRecorder()
 	allHandler(nil, true).ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404 from fallback.Unmatched", rec.Code)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 from fallback.TooLarge", rec.Code)
 	}
 	logContent := readTestLog(t, logPath)
 	if entries := strings.Count(strings.TrimSpace(logContent), "\n") + 1; entries != 1 {
 		t.Fatalf("log entries = %d, want 1: %s", entries, logContent)
 	}
-	if !strings.Contains(logContent, `"trapped":"false"`) {
-		t.Fatalf("chunked oversized request not logged as trapped=false: %s", logContent)
+	for _, want := range []string{`"trapped":"false"`, `"payload_too_large":"true"`, `"content_length":"chunked"`} {
+		if !strings.Contains(logContent, want) {
+			t.Fatalf("chunked oversized request log missing %s: %s", want, logContent)
+		}
 	}
 }

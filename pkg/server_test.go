@@ -1,0 +1,147 @@
+package h0neytr4p
+
+import (
+	"bufio"
+	"bytes"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// Real-server tests: httptest.Recorder hides HEAD framing, mux routing of
+// CONNECT, and MaxBytesReader behaviour on chunked bodies.
+
+func loginTrap() Trap {
+	return Trap{
+		Basicinfo: BasicInfo{Name: "moodle", Port: "80"},
+		Behaviour: []Behaviour{{
+			Request: Request{URL: "/login/index.php", Method: http.MethodGet, Headers: map[string]interface{}{}, Params: map[string]interface{}{}},
+			Response: Response{Statuscode: 200, Type: "string", Body: strings.Repeat("<p>login</p>\n", 400),
+				Headers: map[string]interface{}{"Content-Type": "text/html; charset=utf-8", "Server": "Apache/2.4.58 (Ubuntu)"}},
+		}},
+	}
+}
+
+func startServer(t *testing.T, traps []Trap) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(newTrapRouter(traps, true))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestServerHeadMatchesGetTrap(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, []Trap{loginTrap()})
+
+	resp, err := http.Head(srv.URL + "/login/index.php")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("HEAD status = %d, want 200 (the GET trap's status)", resp.StatusCode)
+	}
+	if resp.Header.Get("Server") != "Apache/2.4.58 (Ubuntu)" {
+		t.Fatalf("HEAD Server header = %q", resp.Header.Get("Server"))
+	}
+	if want := strconv.Itoa(len(loginTrap().Behaviour[0].Response.Body)); resp.Header.Get("Content-Length") != want {
+		t.Fatalf("HEAD Content-Length = %q, want %q", resp.Header.Get("Content-Length"), want)
+	}
+	if len(body) != 0 {
+		t.Fatalf("HEAD body length = %d, want 0", len(body))
+	}
+	if !strings.Contains(readTestLog(t, logPath), `"trapped_for":"moodle"`) {
+		t.Fatal("HEAD was not logged against the GET trap")
+	}
+}
+
+func TestServerHeadSpecificBehaviourWinsOverGet(t *testing.T) {
+	configureTestIO(t)
+	trap := loginTrap()
+	headBehaviour := Behaviour{
+		Request:  Request{URL: "/login/index.php", Method: http.MethodHead, Headers: map[string]interface{}{}, Params: map[string]interface{}{}},
+		Response: Response{Statuscode: 204, Type: "string", Body: "", Headers: map[string]interface{}{"Content-Type": "text/html"}},
+	}
+	trap.Behaviour = append([]Behaviour{headBehaviour}, trap.Behaviour...)
+	srv := startServer(t, []Trap{trap})
+
+	resp, err := http.Head(srv.URL + "/login/index.php")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Fatalf("HEAD status = %d, want 204 from the HEAD-specific behaviour", resp.StatusCode)
+	}
+}
+
+func TestServerConnectIsLoggedAndGetsFallback(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nUser-Agent: proxy-probe\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 404 || resp.Header.Get("Server") == "" || !strings.Contains(string(body), "Not Found") {
+		t.Fatalf("CONNECT got %d %q body %q; want the fallback 404 with Server header", resp.StatusCode, resp.Header, body)
+	}
+	if resp.Header.Get("X-Content-Type-Options") != "" {
+		t.Fatal("CONNECT answered by Go's/mux's default handler (X-Content-Type-Options present)")
+	}
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"request_method":"CONNECT"`) || !strings.Contains(logContent, `"user-agent":"proxy-probe"`) {
+		t.Fatalf("CONNECT not logged: %s", logContent)
+	}
+}
+
+func TestServerChunkedOversizedMultipartIs413WithFlag(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormField("PHP_SESSION_UPLOAD_PROGRESS")
+	fw.Write(bytes.Repeat([]byte("A"), 110*1024))
+	mw.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/upload", io.NopCloser(&buf))
+	req.ContentLength = -1 // forces Transfer-Encoding: chunked
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"payload_too_large":"true"`) || !strings.Contains(logContent, `"content_length":"chunked"`) {
+		t.Fatalf("chunked oversized multipart not flagged: %s", logContent)
+	}
+}
