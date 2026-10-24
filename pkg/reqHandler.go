@@ -488,7 +488,7 @@ func logDetails(details map[string]string) {
 	}
 }
 
-func writeTrapResponse(w http.ResponseWriter, behaviour Behaviour) {
+func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behaviour) {
 	var body []byte
 	if behaviour.Response.Type == "file" {
 		content, err := os.ReadFile(behaviour.Response.Body)
@@ -509,7 +509,14 @@ func writeTrapResponse(w http.ResponseWriter, behaviour Behaviour) {
 	if statusCode == 0 {
 		statusCode = http.StatusOK
 	}
+	if r != nil && r.Method == http.MethodHead && w.Header().Get("Content-Length") == "" {
+		// Like Apache: HEAD advertises the body length without sending it.
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	}
 	w.WriteHeader(statusCode)
+	if r != nil && r.Method == http.MethodHead {
+		return
+	}
 	if _, err := w.Write(body); err != nil {
 		log.Printf("Unable to write response content: %v", err)
 	}
@@ -558,12 +565,15 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 					details["trapped_references"] = trap.Basicinfo.References
 				}
 				logDetails(details)
-				writeTrapResponse(w, behaviour)
+				writeTrapResponse(w, r, behaviour)
 				return
 			}
 		}
 
 		logDetails(buildLogDetails(r, ua, payload, false))
+		if fallback != nil {
+			writeTrapResponse(w, r, Behaviour{Response: fallback.Unmatched})
+		}
 	})
 }
 

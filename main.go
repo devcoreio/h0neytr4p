@@ -41,6 +41,7 @@ func main() {
 	key := flag.String("key", "Default", "Certificate File")
 	verbose := flag.Bool("verbose", true, "Use -verbose=false for disabling streaming output; by default it's true.")
 	wildcard := flag.Bool("wildcard", false, "Load all traps on ports 80 and 443.")
+	fallbackPath := flag.String("fallback", "", "JSON with Unmatched/TooLarge responses; empty disables")
 	help := flag.Bool("help", false, "Print Help")
 	flag.Parse()
 
@@ -56,11 +57,16 @@ func main() {
 	fmt.Printf("[ Payload multipart limit ] -> [ %-30d]\n", h0neytr4p.MaxMultipartSize)
 	fmt.Printf("[ Payload other limit     ] -> [ %-30d]\n", h0neytr4p.MaxJSONFormSize)
 	fmt.Printf("[ Wildcard mode           ] -> [ %-30t]\n", *wildcard)
+	fmt.Printf("[ Fallback responses      ] -> [ %-30s]\n", *fallbackPath)
 	fmt.Println()
 
 	trapConfig, err := h0neytr4p.ParseTraps(*trapsFolder)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing traps: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := h0neytr4p.LoadFallback(*fallbackPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading fallback: %v\n", err)
 		os.Exit(1)
 	}
 	if err := h0neytr4p.InitLogFile(*logFile, *verbose); err != nil {
