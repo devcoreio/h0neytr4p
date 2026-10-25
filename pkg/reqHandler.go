@@ -522,14 +522,19 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 		body = []byte(render(string(body)))
 	}
 	for key, value := range convertMap(behaviour.Response.Headers) {
-		if strings.EqualFold(key, "Set-Cookie-If-Missing") {
+		switch {
+		// "Set-Cookie-If-Missing" or "Set-Cookie-If-Missing-<anything>": one
+		// conditional cookie per key, so a response can set several.
+		case strings.HasPrefix(strings.ToLower(key), "set-cookie-if-missing"):
 			name, _, _ := strings.Cut(value, "=")
 			if r != nil && !requestHasCookie(r, strings.TrimSpace(name)) {
 				w.Header().Add("Set-Cookie", render(value))
 			}
-			continue
+		case strings.EqualFold(key, "Set-Cookie"):
+			w.Header().Add("Set-Cookie", render(value)) // never wipe a conditional cookie added earlier
+		default:
+			w.Header().Set(key, render(value))
 		}
-		w.Header().Set(key, render(value))
 	}
 	statusCode := behaviour.Response.Statuscode
 	if statusCode == 0 {

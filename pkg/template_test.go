@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -128,5 +129,42 @@ func TestWriteTrapResponseRendersRequestTokensInBody(t *testing.T) {
 	}})
 	if want := "<address>Apache Server at 203.0.113.50 Port 80</address>"; rec.Body.String() != want {
 		t.Fatalf("body = %q, want %q", rec.Body.String(), want)
+	}
+}
+
+func TestWriteTrapResponseSupportsSeveralConditionalCookies(t *testing.T) {
+	behaviour := Behaviour{Response: Response{
+		Statuscode: 303, Type: "string", Body: "",
+		Headers: map[string]interface{}{
+			"Set-Cookie-If-Missing":                "MoodleSession={{sid}}; path=/; secure; HttpOnly; SameSite=Lax",
+			"Set-Cookie-If-Missing-MDL_SSP_SessID": "MDL_SSP_SessID={{rand_hex:32}}; path=/; secure; HttpOnly",
+			"Set-Cookie":                           "lang=en; path=/",
+			"Content-Type":                         "text/html",
+		},
+	}}
+
+	rec := httptest.NewRecorder()
+	writeTrapResponse(rec, httptest.NewRequest(http.MethodGet, "/", nil), behaviour)
+	got := rec.Header().Values("Set-Cookie")
+	if len(got) != 3 {
+		t.Fatalf("Set-Cookie count = %d (%q), want 3: two conditional + one plain", len(got), got)
+	}
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{`MoodleSession=`, `MDL_SSP_SessID=`, `lang=en; path=/`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("Set-Cookie missing %q: %q", want, got)
+		}
+	}
+	if !regexp.MustCompile(`MDL_SSP_SessID=[0-9a-f]{32};`).MatchString(joined) {
+		t.Fatalf("second conditional cookie not rendered: %q", got)
+	}
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Cookie", "MDL_SSP_SessID=abc")
+	writeTrapResponse(rec, req, behaviour)
+	got = rec.Header().Values("Set-Cookie")
+	if len(got) != 2 || strings.Contains(strings.Join(got, "\n"), "MDL_SSP_SessID=") {
+		t.Fatalf("with MDL_SSP_SessID present, Set-Cookie = %q; want MoodleSession and lang only", got)
 	}
 }
