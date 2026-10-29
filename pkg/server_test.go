@@ -2,9 +2,7 @@ package h0neytr4p
 
 import (
 	"bufio"
-	"bytes"
 	"io"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -131,36 +129,6 @@ func TestServerConnectIsLoggedAndGetsFallback(t *testing.T) {
 	logContent := readTestLog(t, logPath)
 	if !strings.Contains(logContent, `"request_method":"CONNECT"`) || !strings.Contains(logContent, `"user-agent":"proxy-probe"`) {
 		t.Fatalf("CONNECT not logged: %s", logContent)
-	}
-}
-
-func TestServerChunkedOversizedMultipartIs413WithFlag(t *testing.T) {
-	logPath, _ := configureTestIO(t)
-	SetFallback(testFallback())
-	t.Cleanup(func() { SetFallback(nil) })
-	srv := startServer(t, nil)
-
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fw, _ := mw.CreateFormField("PHP_SESSION_UPLOAD_PROGRESS")
-	fw.Write(bytes.Repeat([]byte("A"), 110*1024))
-	mw.Close()
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/upload", io.NopCloser(&buf))
-	req.ContentLength = -1 // forces Transfer-Encoding: chunked
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413", resp.StatusCode)
-	}
-	logContent := readTestLog(t, logPath)
-	if !strings.Contains(logContent, `"payload_too_large":"true"`) || !strings.Contains(logContent, `"content_length":"chunked"`) {
-		t.Fatalf("chunked oversized multipart not flagged: %s", logContent)
 	}
 }
 

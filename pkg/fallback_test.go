@@ -13,16 +13,13 @@ func testFallback() *Fallback {
 	headers := map[string]interface{}{"Server": "Apache/2.4.58 (Ubuntu)", "Content-Type": "text/html; charset=iso-8859-1"}
 	return &Fallback{
 		Unmatched: Response{Statuscode: http.StatusNotFound, Body: "<h1>Not Found</h1>", Headers: headers, Type: "string"},
-		TooLarge:  Response{Statuscode: http.StatusRequestEntityTooLarge, Body: "<h1>Request Entity Too Large</h1>", Headers: headers, Type: "string"},
 	}
 }
 
-func TestLoadFallbackParsesBothResponses(t *testing.T) {
+func TestLoadFallbackParsesUnmatchedResponse(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fallback.json")
 	content := `{
   "Unmatched": {"StatusCode": 404, "Body": "<h1>Not Found</h1>", "Type": "string",
-                "Headers": {"Server": "Apache/2.4.58 (Ubuntu)", "Content-Type": "text/html"}},
-  "TooLarge":  {"StatusCode": 413, "Body": "<h1>Request Entity Too Large</h1>", "Type": "string",
                 "Headers": {"Server": "Apache/2.4.58 (Ubuntu)", "Content-Type": "text/html"}}
 }`
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -36,9 +33,6 @@ func TestLoadFallbackParsesBothResponses(t *testing.T) {
 	}
 	if fb.Unmatched.Statuscode != 404 || fb.Unmatched.Body != "<h1>Not Found</h1>" || fb.Unmatched.Type != "string" {
 		t.Fatalf("Unmatched parsed wrong: %+v", fb.Unmatched)
-	}
-	if fb.TooLarge.Statuscode != 413 || fb.TooLarge.Body != "<h1>Request Entity Too Large</h1>" {
-		t.Fatalf("TooLarge parsed wrong: %+v", fb.TooLarge)
 	}
 	if got := convertMap(fb.Unmatched.Headers)["Server"]; got != "Apache/2.4.58 (Ubuntu)" {
 		t.Fatalf("Unmatched Server header = %q", got)
@@ -114,11 +108,10 @@ func TestLoadFallbackRejectsBadFiles(t *testing.T) {
 	t.Cleanup(func() { SetFallback(nil) })
 	ok := `"StatusCode": 404, "Body": "x", "Type": "string", "Headers": {"Content-Type": "text/html"}`
 	cases := map[string]string{
-		"missing body file":     `{"Unmatched": {"StatusCode": 404, "Body": "/nonexistent/404.html", "Type": "file", "Headers": {"Content-Type": "text/html"}}, "TooLarge": {` + ok + `}}`,
-		"missing TooLarge":      `{"Unmatched": {` + ok + `}}`,
-		"zero status":           `{"Unmatched": {"StatusCode": 0, "Body": "x", "Type": "string", "Headers": {"Content-Type": "text/html"}}, "TooLarge": {` + ok + `}}`,
-		"no Content-Type":       `{"Unmatched": {"StatusCode": 404, "Body": "x", "Type": "string", "Headers": {"Server": "x"}}, "TooLarge": {` + ok + `}}`,
-		"unknown top-level key": `{"Unmatch": {` + ok + `}, "TooLarge": {` + ok + `}}`,
+		"missing body file":     `{"Unmatched": {"StatusCode": 404, "Body": "/nonexistent/404.html", "Type": "file", "Headers": {"Content-Type": "text/html"}}}`,
+		"zero status":           `{"Unmatched": {"StatusCode": 0, "Body": "x", "Type": "string", "Headers": {"Content-Type": "text/html"}}}`,
+		"no Content-Type":       `{"Unmatched": {"StatusCode": 404, "Body": "x", "Type": "string", "Headers": {"Server": "x"}}}`,
+		"unknown top-level key": `{"Unmatch": {` + ok + `}}`,
 	}
 	for name, content := range cases {
 		t.Run(name, func(t *testing.T) {

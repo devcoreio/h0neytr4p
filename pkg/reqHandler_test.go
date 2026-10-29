@@ -693,73 +693,133 @@ func oversizedMultipartRequest(t *testing.T, path string, size int) (*http.Reque
 	return req, mw.Boundary()
 }
 
-func TestAllHandlerLogsOversizedPayload(t *testing.T) {
-	logPath, _ := configureTestIO(t)
-	SetFallback(testFallback())
-	t.Cleanup(func() { SetFallback(nil) })
+const overCapSize = 9 * 1024 * 1024
 
-	req, _ := oversizedMultipartRequest(t, "/upload", 150*1024)
-	req.ContentLength = 153600
-	req.Header.Set("Content-Length", "153600")
+func TestAllHandlerCapturesLargeMultipartUnderNewCap(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormField("PHP_SESSION_UPLOAD_PROGRESS")
+	fw.Write(bytes.Repeat([]byte("A"), 16))
+	ff, _ := mw.CreateFormFile("blob", "blob.bin")
+	ff.Write(bytes.Repeat([]byte("B"), 2200*1024))
+	mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	allHandler(nil, true).ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413", rec.Code)
-	}
-	if rec.Header().Get("Server") == "" {
-		t.Fatal("Server header missing on 413")
-	}
-	if !strings.Contains(rec.Body.String(), "Request Entity Too Large") {
-		t.Fatalf("body = %q, want Apache-style 413 page", rec.Body.String())
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("got 413, want body captured")
 	}
 	logContent := readTestLog(t, logPath)
-	for _, want := range []string{`"payload_too_large":"true"`, `"content_length":"153600"`, `"request_uri":"/upload"`, `"src_ip":"192.168.50.20"`} {
+	for _, want := range []string{`"payload_parameter":`, `PHP_SESSION_UPLOAD_PROGRESS`} {
 		if !strings.Contains(logContent, want) {
 			t.Fatalf("log missing %s: %s", want, logContent)
 		}
 	}
-}
-
-func TestAllHandlerOversizedWithoutFallbackStill413(t *testing.T) {
-	logPath, _ := configureTestIO(t)
-	SetFallback(nil)
-
-	req, _ := oversizedMultipartRequest(t, "/upload", 150*1024)
-	req.ContentLength = 153600
-	rec := httptest.NewRecorder()
-	allHandler(nil, true).ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413", rec.Code)
-	}
-	if !strings.Contains(readTestLog(t, logPath), `"payload_too_large":"true"`) {
-		t.Fatal("oversized request without fallback was not logged")
+	if strings.Contains(logContent, `"payload_too_large"`) {
+		t.Fatalf("log still flags payload_too_large: %s", logContent)
 	}
 }
 
-func TestAllHandlerChunkedOversizedMultipartIs413WithFlag(t *testing.T) {
+func TestAllHandlerOverCapMimicsPHPEmptyPost(t *testing.T) {
 	logPath, _ := configureTestIO(t)
 	SetFallback(testFallback())
 	t.Cleanup(func() { SetFallback(nil) })
 
-	req, _ := oversizedMultipartRequest(t, "/upload", 110*1024)
+	req, _ := oversizedMultipartRequest(t, "/upload", overCapSize)
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = 413, want PHP-shaped non-413")
+	}
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"payload_truncated":"true"`) {
+		t.Fatalf("log missing payload_truncated: %s", logContent)
+	}
+	if strings.Contains(logContent, `"payload_parameter"`) || strings.Contains(logContent, `"blob"`) {
+		t.Fatalf("log contains parsed body field: %.300s", logContent)
+	}
+	if len(logContent) > 2*MaxStoredPayload {
+		t.Fatalf("log entry %d bytes, stored payload not bounded", len(logContent))
+	}
+}
+
+func TestAllHandlerOverCapNoFallbackNo413(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(nil)
+
+	req, _ := oversizedMultipartRequest(t, "/upload", overCapSize)
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = 413, want non-413")
+	}
+	if !strings.Contains(readTestLog(t, logPath), `"payload_truncated":"true"`) {
+		t.Fatal("over-cap request without fallback was not logged as truncated")
+	}
+}
+
+func TestAllHandlerChunkedOverCapNo413WithFlag(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+
+	req, _ := oversizedMultipartRequest(t, "/upload", overCapSize)
 	req.ContentLength = -1
 	req.Header.Del("Content-Length")
 	req.TransferEncoding = []string{"chunked"}
 	rec := httptest.NewRecorder()
 	allHandler(nil, true).ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413 from fallback.TooLarge", rec.Code)
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = 413, want non-413")
 	}
 	logContent := readTestLog(t, logPath)
 	if entries := strings.Count(strings.TrimSpace(logContent), "\n") + 1; entries != 1 {
-		t.Fatalf("log entries = %d, want 1: %s", entries, logContent)
+		t.Fatalf("log entries = %d, want 1: %.300s", entries, logContent)
 	}
-	for _, want := range []string{`"trapped":"false"`, `"payload_too_large":"true"`, `"content_length":"chunked"`} {
+	for _, want := range []string{`"trapped":"false"`, `"payload_truncated":"true"`} {
 		if !strings.Contains(logContent, want) {
-			t.Fatalf("chunked oversized request log missing %s: %s", want, logContent)
+			t.Fatalf("log missing %s: %.300s", want, logContent)
 		}
+	}
+}
+
+func TestAllHandlerCapturesMultipartAtBoundary(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	req, _ := oversizedMultipartRequest(t, "/upload", 8*1024*1024-1024)
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = 413 at boundary")
+	}
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"payload_parameter":"blob=`) {
+		t.Fatalf("params not parsed at boundary: %.300s", logContent)
+	}
+	if strings.Contains(logContent, `"payload_truncated"`) {
+		t.Fatalf("under-cap body flagged truncated")
+	}
+}
+
+func TestStoredPayloadBoundedForLargeJSON(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	body := `{"a":"` + strings.Repeat("A", overCapSize) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"payload_truncated":"true"`) {
+		t.Fatalf("log missing payload_truncated: %.300s", logContent)
+	}
+	if len(logContent) > 2*MaxStoredPayload {
+		t.Fatalf("log entry %d bytes, stored payload not bounded", len(logContent))
 	}
 }

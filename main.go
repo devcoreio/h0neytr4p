@@ -41,7 +41,7 @@ func main() {
 	key := flag.String("key", "Default", "Certificate File")
 	verbose := flag.Bool("verbose", true, "Use -verbose=false for disabling streaming output; by default it's true.")
 	wildcard := flag.Bool("wildcard", false, "Load all traps on ports 80 and 443.")
-	fallbackPath := flag.String("fallback", "", "JSON with Unmatched/TooLarge responses; empty disables")
+	fallbackPath := flag.String("fallback", "", "JSON with the Unmatched response; empty disables")
 	help := flag.Bool("help", false, "Print Help")
 	flag.Parse()
 

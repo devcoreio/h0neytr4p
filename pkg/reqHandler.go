@@ -27,10 +27,7 @@ import (
 	"github.com/ua-parser/uap-go/uaparser"
 )
 
-var (
-	uaParser           *uaparser.Parser
-	errPayloadTooLarge = errors.New("payload too large")
-)
+var uaParser *uaparser.Parser
 
 type requestPayload struct {
 	data      string
@@ -39,6 +36,7 @@ type requestPayload struct {
 	filename  string
 	mimeType  string
 	params    map[string]string
+	truncated bool // body exceeded a cap or the stored raw body was cut to MaxStoredPayload
 }
 
 func init() {
@@ -299,15 +297,40 @@ func parseJSONBodyParams(body []byte) map[string]string {
 	return convertMap(values)
 }
 
-func readLimited(reader io.Reader, limit int64) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(reader, limit+1))
+// readLimited reads at most limit bytes. When the reader holds more, it
+// returns the first limit bytes and overflow=true.
+func readLimited(reader io.Reader, limit int64) (data []byte, overflow bool, err error) {
+	data, err = io.ReadAll(io.LimitReader(reader, limit+1))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if int64(len(data)) > limit {
-		return nil, errPayloadTooLarge
+		return data[:limit], true, nil
 	}
-	return data, nil
+	return data, false, nil
+}
+
+// storeRaw keeps at most MaxStoredPayload bytes of a raw body in the payload.
+func (p *requestPayload) storeRaw(s string) {
+	if len(s) > MaxStoredPayload {
+		s = s[:MaxStoredPayload]
+		p.truncated = true
+	}
+	p.data = s
+}
+
+// overCap mimics PHP past post_max_size: body superglobals stay empty, only a
+// bounded prefix of the raw body is kept, and the request is flagged.
+func (p *requestPayload) overCap(body io.Reader, prefix []byte) {
+	p.truncated = true
+	if body != nil {
+		rest, _ := io.ReadAll(io.LimitReader(body, int64(MaxStoredPayload-len(prefix))))
+		prefix = append(prefix, rest...)
+	}
+	if len(prefix) > MaxStoredPayload {
+		prefix = prefix[:MaxStoredPayload]
+	}
+	p.data = string(prefix)
 }
 
 func newRequestPayload(r *http.Request) requestPayload {
@@ -324,24 +347,39 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 
 	contentType := requestContentType(r)
 	sizeLimit := payloadSizeLimit(contentType)
+	// Over-cap bodies are never rejected (PHP answers 200 with empty
+	// superglobals); a declared oversize length skips parsing entirely.
 	if r.ContentLength > sizeLimit {
-		return payload, fmt.Errorf("%w: %d exceeds %d bytes", errPayloadTooLarge, r.ContentLength, sizeLimit)
+		if contentType == "multipart/form-data" {
+			payload.truncated = true
+		} else {
+			payload.overCap(r.Body, nil)
+		}
+		return payload, nil
 	}
 
 	switch contentType {
 	case "application/json":
-		bodyBytes, err := readLimited(r.Body, sizeLimit)
+		bodyBytes, overflow, err := readLimited(r.Body, sizeLimit)
 		if err != nil {
 			return payload, fmt.Errorf("read JSON body: %w", err)
 		}
-		payload.data = string(bodyBytes)
+		if overflow {
+			payload.overCap(nil, bodyBytes)
+			return payload, nil
+		}
+		payload.storeRaw(string(bodyBytes))
 		mergeParams(payload.params, parseJSONBodyParams(bodyBytes))
 	case "multipart/form-data":
 		r.Body = http.MaxBytesReader(w, r.Body, sizeLimit)
 		if err := r.ParseMultipartForm(sizeLimit); err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
-				return payload, fmt.Errorf("%w: multipart body exceeds %d bytes", errPayloadTooLarge, sizeLimit)
+				if r.MultipartForm != nil {
+					_ = r.MultipartForm.RemoveAll()
+				}
+				payload.truncated = true
+				return payload, nil
 			}
 			return payload, fmt.Errorf("parse multipart form: %w", err)
 		}
@@ -369,7 +407,7 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 					log.Printf("Error opening file: %v", err)
 					continue
 				}
-				fileBytes, err := readLimited(file, MaxMultipartSize)
+				fileBytes, _, err := readLimited(file, MaxMultipartSize)
 				closeErr := file.Close()
 				if err != nil {
 					log.Printf("Error reading file: %v", err)
@@ -398,20 +436,28 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 			}
 		}
 	case "application/x-www-form-urlencoded":
-		bodyBytes, err := readLimited(r.Body, sizeLimit)
+		bodyBytes, overflow, err := readLimited(r.Body, sizeLimit)
 		if err != nil {
 			return payload, fmt.Errorf("read form body: %w", err)
 		}
+		if overflow {
+			payload.overCap(nil, bodyBytes)
+			return payload, nil
+		}
 		bodyParams := parseBodyParams(string(bodyBytes))
 		mergeParams(payload.params, bodyParams)
-		payload.data = formatParams(bodyParams)
+		payload.storeRaw(formatParams(bodyParams))
 	case "text/plain":
-		bodyBytes, err := readLimited(r.Body, sizeLimit)
+		bodyBytes, overflow, err := readLimited(r.Body, sizeLimit)
 		if err != nil {
 			return payload, fmt.Errorf("read text body: %w", err)
 		}
-		payload.data = string(bodyBytes)
-		mergeParams(payload.params, parseBodyParams(payload.data))
+		if overflow {
+			payload.overCap(nil, bodyBytes)
+			return payload, nil
+		}
+		payload.storeRaw(string(bodyBytes))
+		mergeParams(payload.params, parseBodyParams(string(bodyBytes)))
 	}
 
 	return payload, nil
@@ -472,6 +518,9 @@ func buildLogDetails(r *http.Request, ua *uaparser.Client, payload requestPayloa
 		details["payload_hash_md5"] = payload.hashMD5
 		details["payload_filename"] = payload.filename
 		details["payload_mime_type"] = payload.mimeType
+	}
+	if payload.truncated {
+		details["payload_truncated"] = "true"
 	}
 	if payload.data != "" {
 		details["payload"] = payload.data
@@ -563,23 +612,6 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 			capturedPayload, err := captureRequestPayload(w, r, payload)
 			payload = capturedPayload
 			if err != nil {
-				if errors.Is(err, errPayloadTooLarge) {
-					log.Printf("Payload exceeds the allowed limit: %v", err)
-					details := buildLogDetails(r, ua, payload, false)
-					details["payload_too_large"] = "true"
-					if r.ContentLength < 0 {
-						details["content_length"] = "chunked"
-					} else {
-						details["content_length"] = strconv.FormatInt(r.ContentLength, 10)
-					}
-					logDetails(details)
-					if fallback != nil {
-						writeTrapResponse(w, r, Behaviour{Response: fallback.TooLarge})
-					} else {
-						http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
-					}
-					return
-				}
 				log.Printf("Error processing payload: %v", err)
 			}
 		}

@@ -43,8 +43,14 @@ type Response struct {
 }
 
 const (
-	MaxMultipartSize = 101 * 1024 // 101KB
-	MaxJSONFormSize  = 11 * 1024  // 11KB
+	// Body caps mirror PHP's post_max_size (8M) so exploit-sized bodies are
+	// captured; larger bodies get PHP's empty-superglobals behaviour, not a 413.
+	MaxMultipartSize = 8 * 1024 * 1024
+	MaxJSONFormSize  = 8 * 1024 * 1024
+
+	// MaxStoredPayload bounds the raw body prefix kept in the log entry so an
+	// oversized body cannot bloat Elasticsearch or process memory.
+	MaxStoredPayload = 64 * 1024
 
 	// T-Pot expects group-readable/group-writable runtime artifacts.
 	RuntimeDirMode  os.FileMode = 0775

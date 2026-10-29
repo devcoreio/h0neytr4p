@@ -8,13 +8,11 @@ import (
 	"strings"
 )
 
-// Fallback holds the responses served when no trap matches (Unmatched) and
-// when a payload exceeds the size limits (TooLarge). It lets the honeypot keep
-// one consistent server persona on every path instead of Go's empty 200 and
-// plain-text 413.
+// Fallback holds the response served when no trap matches (Unmatched). It lets
+// the honeypot keep one consistent server persona on every path instead of
+// Go's empty 200.
 type Fallback struct {
 	Unmatched Response `json:"Unmatched"`
-	TooLarge  Response `json:"TooLarge"`
 }
 
 var fallback *Fallback
@@ -37,9 +35,6 @@ func LoadFallback(path string) (*Fallback, error) {
 		return nil, fmt.Errorf("parse fallback %s: %w", path, err)
 	}
 	if err := validateFallbackResponse("Unmatched", fb.Unmatched); err != nil {
-		return nil, fmt.Errorf("fallback %s: %w", path, err)
-	}
-	if err := validateFallbackResponse("TooLarge", fb.TooLarge); err != nil {
 		return nil, fmt.Errorf("fallback %s: %w", path, err)
 	}
 	SetFallback(fb)
