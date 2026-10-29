@@ -351,6 +351,8 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 	// superglobals); a declared oversize length skips parsing entirely.
 	if r.ContentLength > sizeLimit {
 		if contentType == "multipart/form-data" {
+			// Intentional asymmetry: multipart over-cap stores no raw prefix (only
+			// the payload_truncated flag); other types keep up to MaxStoredPayload.
 			payload.truncated = true
 		} else {
 			payload.overCap(r.Body, nil)

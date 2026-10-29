@@ -822,4 +822,18 @@ func TestStoredPayloadBoundedForLargeJSON(t *testing.T) {
 	if len(logContent) > 2*MaxStoredPayload {
 		t.Fatalf("log entry %d bytes, stored payload not bounded", len(logContent))
 	}
+
+	// PHP-empty superglobals: no body params may be merged for an over-cap body.
+	req2 := httptest.NewRequest(http.MethodPost, "/api", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	got, err := captureRequestPayload(httptest.NewRecorder(), req2, newRequestPayload(req2))
+	if err != nil {
+		t.Fatalf("captureRequestPayload() error = %v", err)
+	}
+	if len(got.params) != 0 {
+		t.Fatalf("body params merged for over-cap body: %d params", len(got.params))
+	}
+	if len(got.data) > MaxStoredPayload || !got.truncated {
+		t.Fatalf("stored %d bytes, truncated=%v", len(got.data), got.truncated)
+	}
 }
