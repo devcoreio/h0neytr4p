@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func configureTestIO(t *testing.T) (string, string) {
@@ -907,3 +908,24 @@ type closeTracker struct {
 }
 
 func (c closeTracker) Close() error { *c.closed = true; return nil }
+
+func TestWantsKeepAliveTokens(t *testing.T) {
+	cases := map[string]bool{"keep-alive": true, "Keep-Alive": true, "keep-alive, Upgrade": true, "Keep-Alive,close": false, "close": false, "xxxxx": false, "": false}
+	for v, want := range cases {
+		h := http.Header{}
+		if v != "" {
+			h.Set("Connection", v)
+		}
+		if got := wantsKeepAlive(h); got != want {
+			t.Errorf("%q: got %v want %v", v, got, want)
+		}
+	}
+}
+
+func TestNewServerIdleTimeoutIsFiveSeconds(t *testing.T) {
+	// Apache advertises Keep-Alive: timeout=5 and closes idle connections
+	// after 5 s; holding them for Go's longer default is measurable.
+	if got := newServer("80", http.NotFoundHandler()).IdleTimeout; got != 5*time.Second {
+		t.Fatalf("IdleTimeout = %v", got)
+	}
+}

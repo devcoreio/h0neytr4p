@@ -2,6 +2,7 @@ package h0neytr4p
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
@@ -20,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -675,6 +677,73 @@ func logDetails(details map[string]string) {
 	}
 }
 
+// connRequestCount counts the requests served on one connection.
+type connRequestCount struct{ n int32 }
+
+type connCountKey struct{}
+
+type reqNumKey struct{}
+
+// requestNumber increments and returns the connection's request counter (1
+// for the first request); 1 when the connection has no counter.
+func requestNumber(r *http.Request) int32 {
+	c, ok := r.Context().Value(connCountKey{}).(*connRequestCount)
+	if !ok {
+		return 1
+	}
+	return atomic.AddInt32(&c.n, 1)
+}
+
+// reqNumFrom returns the request number allHandler stored on the request
+// context (1 when absent).
+func reqNumFrom(r *http.Request) int32 {
+	if n, ok := r.Context().Value(reqNumKey{}).(int32); ok {
+		return n
+	}
+	return 1
+}
+
+// wantsKeepAlive reports whether the client's Connection header carries a
+// keep-alive token and no close token.
+func wantsKeepAlive(h http.Header) bool {
+	keepAlive := false
+	for _, v := range h.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			switch {
+			case strings.EqualFold(strings.TrimSpace(tok), "close"):
+				return false
+			case strings.EqualFold(strings.TrimSpace(tok), "keep-alive"):
+				keepAlive = true
+			}
+		}
+	}
+	return keepAlive
+}
+
+// applyApacheConnectionHeaders mimics Apache 2.4 with KeepAlive On,
+// KeepAliveTimeout 5, MaxKeepAliveRequests 100: a client that asks for
+// keep-alive gets Keep-Alive/Connection headers with max counting down per
+// request; an HTTP/1.1 client that does not ask gets neither; an HTTP/1.0
+// client that does not ask gets Connection: close. Apache buffers an HTTP/1.0
+// keep-alive response to frame it with a Content-Length (and Go would
+// otherwise close the connection and drop the Connection header), so set one
+// unless the trap did; bodyLen is the body a GET would carry, so HEAD reports
+// the same length.
+func applyApacheConnectionHeaders(w http.ResponseWriter, r *http.Request, n int32, bodyLen int) {
+	h := w.Header()
+	if wantsKeepAlive(r.Header) {
+		h.Set("Keep-Alive", fmt.Sprintf("timeout=5, max=%d", 101-n))
+		h.Set("Connection", "Keep-Alive")
+		if !r.ProtoAtLeast(1, 1) && h.Get("Content-Length") == "" {
+			h.Set("Content-Length", strconv.Itoa(bodyLen))
+		}
+		return
+	}
+	if !r.ProtoAtLeast(1, 1) {
+		h.Set("Connection", "close")
+	}
+}
+
 func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behaviour) {
 	var body []byte
 	if behaviour.Response.Type == "file" {
@@ -712,9 +781,13 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 	if statusCode == 0 {
 		statusCode = http.StatusOK
 	}
+	if r != nil {
+		applyApacheConnectionHeaders(w, r, reqNumFrom(r), len(body))
+	}
 	// HEAD sends no body. Content-Length is only advertised when the trap sets
-	// it explicitly (static assets); Apache omits it for dynamic pages and
-	// error documents, and so does Go when nothing is written.
+	// it explicitly (static assets) or for an HTTP/1.0 keep-alive response;
+	// Apache omits it for dynamic pages and error documents, and so does Go
+	// when nothing is written.
 	w.WriteHeader(statusCode)
 	if r != nil && r.Method == http.MethodHead {
 		return
@@ -727,6 +800,8 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 // Passing `trapConfig` parameter so each instance can handle its own traps independently.
 func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Count the request once against its connection, for Keep-Alive max.
+		r = r.WithContext(context.WithValue(r.Context(), reqNumKey{}, requestNumber(r)))
 		ua := uaParser.Parse(r.Header.Get("User-Agent"))
 		payload := newRequestPayload(r)
 		isMatchedRequest := hasMatchingRequest(trapConfig, r.Method, r.URL.Path)
@@ -800,14 +875,23 @@ func newTrapRouter(trapConfig []Trap, catchall bool) *mux.Router {
 // is a stock Ubuntu Apache, which does not enable mod_http2, and Go would
 // otherwise advertise h2 in the TLS ALPN.
 func newServer(port string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              ":" + port,
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		TLSNextProto:      map[string]func(*http.Server, *tls.Conn, http.Handler){},
+	s := &http.Server{Addr: ":" + port, Handler: handler}
+	configureServer(s)
+	return s
+}
+
+// configureServer applies the listener settings shared by production and the
+// real-server tests. IdleTimeout matches the timeout=5 advertised in Apache's
+// Keep-Alive header (KeepAliveTimeout 5). ConnContext gives every connection
+// a request counter so Keep-Alive max can count down as Apache's does.
+func configureServer(s *http.Server) {
+	s.ReadHeaderTimeout = 10 * time.Second
+	s.ReadTimeout = 30 * time.Second
+	s.WriteTimeout = 30 * time.Second
+	s.IdleTimeout = 5 * time.Second
+	s.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+	s.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+		return context.WithValue(ctx, connCountKey{}, &connRequestCount{})
 	}
 }
 

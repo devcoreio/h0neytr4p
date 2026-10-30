@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Real-server tests: httptest.Recorder hides HEAD framing, mux routing of
@@ -29,7 +30,9 @@ func loginTrap() Trap {
 
 func startServer(t *testing.T, traps []Trap) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(newTrapRouter(traps, true))
+	srv := httptest.NewUnstartedServer(newTrapRouter(traps, true))
+	configureServer(srv.Config) // same ConnContext and timeouts as production
+	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -349,4 +352,151 @@ func TestServerChunkedSmallJSONIsDrainedKeepAlive(t *testing.T) {
 	body = append(body, `"}`...)
 	resp, cr := postKeepAlive(t, srv, "/", "application/json", body, false)
 	assertDrainedKeepAlive(t, resp, cr, int64(len(body)))
+}
+
+// rawExchange sends the given request texts on ONE connection and returns the
+// parsed responses in order, so a test sees exactly what went over the wire
+// (Go's client would hide Connection/Keep-Alive handling).
+func rawExchange(t *testing.T, addr string, reqs ...string) []*http.Response {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+	resps := make([]*http.Response, 0, len(reqs))
+	for i, req := range reqs {
+		if _, err := io.WriteString(conn, req); err != nil {
+			t.Fatalf("request %d: write: %v", i, err)
+		}
+		method, _, _ := strings.Cut(req, " ")
+		resp, err := http.ReadResponse(br, &http.Request{Method: method})
+		if err != nil {
+			t.Fatalf("request %d: read response (connection closed?): %v", i, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("request %d: read body: %v", i, err)
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resps = append(resps, resp)
+	}
+	return resps
+}
+
+func startKeepAliveServer(t *testing.T) string {
+	t.Helper()
+	configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	return strings.TrimPrefix(startServer(t, []Trap{loginTrap()}).URL, "http://")
+}
+
+func rawRequest(method, path, proto, connection string) string {
+	req := method + " " + path + " " + proto + "\r\nHost: example.com\r\n"
+	if connection != "" {
+		req += "Connection: " + connection + "\r\n"
+	}
+	return req + "\r\n"
+}
+
+func TestServerKeepAliveHeadersWhenAsked(t *testing.T) {
+	addr := startKeepAliveServer(t)
+	req := rawRequest("GET", "/login/index.php", "HTTP/1.1", "keep-alive")
+	resps := rawExchange(t, addr, req, req)
+
+	// Apache with KeepAlive On, KeepAliveTimeout 5, MaxKeepAliveRequests 100
+	// counts max down by one per request on the connection.
+	if got := resps[0].Header.Get("Keep-Alive"); got != "timeout=5, max=100" {
+		t.Errorf("first Keep-Alive = %q", got)
+	}
+	if got := resps[0].Header.Get("Connection"); got != "Keep-Alive" {
+		t.Errorf("first Connection = %q", got)
+	}
+	if got := resps[1].Header.Get("Keep-Alive"); got != "timeout=5, max=99" {
+		t.Errorf("second Keep-Alive = %q", got)
+	}
+	if got := resps[1].Header.Get("Connection"); got != "Keep-Alive" {
+		t.Errorf("second Connection = %q", got)
+	}
+}
+
+func TestServerNoKeepAliveHeadersWithoutToken(t *testing.T) {
+	addr := startKeepAliveServer(t)
+	// Apache sends neither header to an HTTP/1.1 client that sent no
+	// Connection header or only an unknown token.
+	for _, connection := range []string{"", "xxxxx"} {
+		resp := rawExchange(t, addr, rawRequest("GET", "/login/index.php", "HTTP/1.1", connection))[0]
+		if ka, c := resp.Header.Get("Keep-Alive"), resp.Header.Get("Connection"); ka != "" || c != "" {
+			t.Errorf("Connection %q: got Keep-Alive %q Connection %q, want neither", connection, ka, c)
+		}
+	}
+}
+
+func TestServerHTTP10WithoutTokenCloses(t *testing.T) {
+	addr := startKeepAliveServer(t)
+	resp := rawExchange(t, addr, rawRequest("GET", "/login/index.php", "HTTP/1.0", ""))[0]
+	if got := resp.Header.Get("Connection"); got != "close" {
+		t.Errorf("Connection = %q, want close", got)
+	}
+	if got := resp.Header.Get("Keep-Alive"); got != "" {
+		t.Errorf("Keep-Alive = %q, want none", got)
+	}
+}
+
+func TestServerHTTP10KeepAliveGetsContentLengthAndStaysOpen(t *testing.T) {
+	addr := startKeepAliveServer(t)
+	req := rawRequest("GET", "/login/index.php", "HTTP/1.0", "keep-alive")
+	resps := rawExchange(t, addr, req, req) // the second response proves reuse
+
+	body, _ := io.ReadAll(resps[0].Body)
+	if got := resps[0].Header.Get("Keep-Alive"); got != "timeout=5, max=100" {
+		t.Errorf("Keep-Alive = %q", got)
+	}
+	if got := resps[0].Header.Get("Connection"); got != "Keep-Alive" {
+		t.Errorf("Connection = %q", got)
+	}
+	// Apache buffers an HTTP/1.0 keep-alive response to frame it with a length.
+	if got, want := resps[0].Header.Get("Content-Length"), strconv.Itoa(len(body)); got != want || len(body) == 0 {
+		t.Errorf("Content-Length = %q, body %d bytes", got, len(body))
+	}
+	if got := resps[1].Header.Get("Keep-Alive"); got != "timeout=5, max=99" {
+		t.Errorf("second Keep-Alive = %q", got)
+	}
+}
+
+func TestServerHTTP10KeepAliveHeadIsReusable(t *testing.T) {
+	addr := startKeepAliveServer(t)
+	req := rawRequest("HEAD", "/login/index.php", "HTTP/1.0", "keep-alive")
+	resps := rawExchange(t, addr, req, req)
+
+	want := strconv.Itoa(len(loginTrap().Behaviour[0].Response.Body))
+	if got := resps[0].Header.Get("Content-Length"); got != want {
+		t.Errorf("HEAD Content-Length = %q, want the GET body length %s", got, want)
+	}
+	if body, _ := io.ReadAll(resps[0].Body); len(body) != 0 {
+		t.Errorf("HEAD body length = %d, want 0", len(body))
+	}
+	if got := resps[0].Header.Get("Connection"); got != "Keep-Alive" {
+		t.Errorf("HEAD Connection = %q", got)
+	}
+	if got := resps[1].Header.Get("Keep-Alive"); got != "timeout=5, max=99" {
+		t.Errorf("second HEAD Keep-Alive = %q", got)
+	}
+}
+
+func TestServerKeepAliveOnFallback404(t *testing.T) {
+	addr := startKeepAliveServer(t)
+	resp := rawExchange(t, addr, rawRequest("GET", "/nope", "HTTP/1.1", "keep-alive"))[0]
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want the fallback 404", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Keep-Alive"); got != "timeout=5, max=100" {
+		t.Errorf("Keep-Alive = %q", got)
+	}
+	if got := resp.Header.Get("Connection"); got != "Keep-Alive" {
+		t.Errorf("Connection = %q", got)
+	}
 }
