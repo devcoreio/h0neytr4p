@@ -153,3 +153,51 @@ func TestAllHandlerDeclaredOverCapMultipartKeepsPrefix(t *testing.T) {
 		t.Fatalf("params=%d truncated=%v stored=%d, want 0/true/%d", len(got.params), got.truncated, len(got.data), MaxStoredPayload)
 	}
 }
+
+func TestAllHandlerCapturesBodyWithoutContentType(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	body := `[{"index":0,"methodname":"core_session_touch","args":{}}]`
+	req := httptest.NewRequest(http.MethodPost, "/lib/ajax/service.php", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"payload":"`) || !strings.Contains(logContent, "core_session_touch") {
+		t.Fatalf("body without Content-Type not stored: %.300s", logContent)
+	}
+	for _, unwanted := range []string{`"payload_parameter"`, `"payload_truncated"`} {
+		if strings.Contains(logContent, unwanted) {
+			t.Fatalf("log has %s for a small raw body: %.300s", unwanted, logContent)
+		}
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/lib/ajax/service.php", strings.NewReader(body))
+	got, err := captureRequestPayload(httptest.NewRecorder(), req2, newRequestPayload(req2))
+	if err != nil {
+		t.Fatalf("captureRequestPayload() error = %v", err)
+	}
+	if got.data != body || len(got.params) != 0 || got.truncated {
+		t.Fatalf("stored=%d bytes params=%d truncated=%v, want whole body, no params", len(got.data), len(got.params), got.truncated)
+	}
+}
+
+func TestAllHandlerOctetStreamOverCapBounded(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	body := strings.Repeat("B", overCapSize)
+	req := httptest.NewRequest(http.MethodPut, "/webdav/x.bin", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = -1 // chunked: the declared-length shortcut must not apply
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	logContent := readTestLog(t, logPath)
+	for _, want := range []string{`"payload_truncated":"true"`, `"payload":"BBBB`} {
+		if !strings.Contains(logContent, want) {
+			t.Fatalf("log missing %s: %.300s", want, logContent)
+		}
+	}
+	if len(logContent) > 2*MaxStoredPayload {
+		t.Fatalf("log entry %d bytes, stored prefix not bounded", len(logContent))
+	}
+}
+

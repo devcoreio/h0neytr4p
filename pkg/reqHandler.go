@@ -486,6 +486,19 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 		}
 		payload.storeRaw(string(bodyBytes))
 		mergeParams(payload.params, parseBodyParams(string(bodyBytes)))
+	default:
+		// No or unlisted Content-Type (octet-stream, xml, ...): PHP leaves
+		// $_POST empty but php://input has the body, so keep a bounded raw
+		// prefix and merge nothing.
+		bodyBytes, overflow, err := readLimited(r.Body, sizeLimit)
+		if err != nil {
+			return payload, fmt.Errorf("read raw body: %w", err)
+		}
+		if overflow {
+			payload.overCap(nil, bodyBytes)
+			return payload, nil
+		}
+		payload.storeRaw(string(bodyBytes))
 	}
 
 	return payload, nil
