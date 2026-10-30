@@ -555,3 +555,33 @@ func TestServerKeepAliveClosesAfterMaxRequests(t *testing.T) {
 		t.Fatal("request 102 succeeded; want the connection closed after request 101")
 	}
 }
+
+func TestServerPHPResponseIsDelayedStaticIsNot(t *testing.T) {
+	configureTestIO(t)
+	fb := testFallback()
+	fb.Timing = Timing{PhpBaseMs: 80, PhpJitterMs: 0}
+	SetFallback(fb)
+	t.Cleanup(func() { SetFallback(nil) })
+	trap := loginTrap()
+	trap.Behaviour[0].Response.Headers["X-Powered-By"] = "PHP/8.3.6"
+	srv := startServer(t, []Trap{trap})
+
+	timeGet := func(path string) time.Duration {
+		t.Helper()
+		start := time.Now()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return time.Since(start)
+	}
+
+	if elapsed := timeGet("/login/index.php"); elapsed < 70*time.Millisecond {
+		t.Fatalf("PHP page answered in %v, want >= 70ms (PhpBaseMs 80)", elapsed)
+	}
+	if elapsed := timeGet("/nope"); elapsed >= 40*time.Millisecond {
+		t.Fatalf("static 404 answered in %v, want < 40ms (no X-Powered-By, no delay)", elapsed)
+	}
+}

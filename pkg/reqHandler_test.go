@@ -929,3 +929,48 @@ func TestNewServerIdleTimeoutIsFiveSeconds(t *testing.T) {
 		t.Fatalf("IdleTimeout = %v", got)
 	}
 }
+
+func TestResponseDelayModel(t *testing.T) {
+	php := Response{Headers: map[string]interface{}{"X-Powered-By": "PHP/8.3.6", "Content-Type": "text/html"}}
+	static := Response{Headers: map[string]interface{}{"Content-Type": "text/html"}}
+	tm := Timing{PhpBaseMs: 6, PhpJitterMs: 2, PhpPerMBMs: 20}
+	multipartMs := 6 + 20*2201156.0/1048576 // ~47.98ms; a variable, since the constant is not a whole Duration
+	cases := []struct {
+		name string
+		resp Response
+		ct   string
+		n    int64
+		jit  float64
+		tm   Timing
+		want time.Duration
+	}{
+		{"static 404", static, "", 0, 0, tm, 0},
+		{"php get", php, "", 0, 0, tm, 6 * time.Millisecond},
+		{"php get jitter", php, "", 0, -2, tm, 4 * time.Millisecond},
+		{"php 2.2MB multipart", php, "multipart/form-data", 2201156, 0, tm, time.Duration(multipartMs * float64(time.Millisecond))},
+		{"php over-cap multipart", php, "multipart/form-data", 9 * 1024 * 1024, 0, tm, 6 * time.Millisecond},
+		{"php 1MB json", php, "application/json", 1048576, 0, tm, 6 * time.Millisecond},
+		{"timing off", php, "multipart/form-data", 2201156, 0, Timing{}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := responseDelay(c.resp, c.ct, c.n, c.tm, c.jit)
+			diff := got - c.want
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > time.Millisecond {
+				t.Fatalf("responseDelay = %v, want %v (within 1ms)", got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsPHPResponseCaseInsensitive(t *testing.T) {
+	if !isPHPResponse(Response{Headers: map[string]interface{}{"x-powered-by": "PHP/8.3.6"}}) {
+		t.Fatal("lower-case x-powered-by not recognised")
+	}
+	if isPHPResponse(Response{Headers: map[string]interface{}{"Server": "Apache"}}) {
+		t.Fatal("response without X-Powered-By recognised as PHP")
+	}
+}

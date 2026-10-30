@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"mime"
 	"net"
 	"net/http"
@@ -753,6 +754,52 @@ func applyApacheConnectionHeaders(w http.ResponseWriter, r *http.Request, n int3
 	}
 }
 
+// isPHPResponse reports whether a response is one PHP would have generated:
+// the persona's PHP pages carry X-Powered-By, while static assets and Apache's
+// own error documents do not.
+func isPHPResponse(resp Response) bool {
+	for key := range resp.Headers {
+		if strings.EqualFold(key, "X-Powered-By") {
+			return true
+		}
+	}
+	return false
+}
+
+// responseDelay is how long a PHP response waits before it is written, so
+// that a scanner timing a PHP path against a static 404 sees PHP's cost:
+// PhpBaseMs plus the caller's jitter sample, plus PhpPerMBMs per MB of a
+// multipart body PHP would have parsed (bodies over MaxMultipartSize are
+// rejected before PHP sees them, so they pay nothing extra). Static responses
+// get no delay. The result never goes below zero.
+func responseDelay(resp Response, contentType string, bodyLen int64, t Timing, jitter float64) time.Duration {
+	if !isPHPResponse(resp) {
+		return 0
+	}
+	ms := t.PhpBaseMs + jitter
+	if contentType == "multipart/form-data" && bodyLen <= MaxMultipartSize {
+		ms += t.PhpPerMBMs * float64(bodyLen) / 1048576
+	}
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms * float64(time.Millisecond))
+}
+
+// sampledJitter draws a uniform jitter in [-PhpJitterMs, +PhpJitterMs).
+func sampledJitter(t Timing) float64 {
+	return rand.Float64()*2*t.PhpJitterMs - t.PhpJitterMs
+}
+
+// phpDelay sleeps for the response's PHP-shaped delay. It runs after the
+// body drain: Apache reads the request body, then PHP runs the page.
+func phpDelay(r *http.Request, resp Response, bodyLen int64) {
+	t := currentTiming()
+	if d := responseDelay(resp, requestContentType(r), bodyLen, t, sampledJitter(t)); d > 0 {
+		time.Sleep(d)
+	}
+}
+
 func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behaviour) {
 	var body []byte
 	if behaviour.Response.Type == "file" {
@@ -830,7 +877,6 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 		// connection open; answering mid-upload makes net/http close it.
 		drainBody(r.Body, MaxDrainSize)
 		bodyLen := requestBodyLength(r, body.n)
-		_ = bodyLen // consumed by the response-delay model (later task)
 
 		for _, trap := range trapConfig {
 			for _, behaviour := range trap.Behaviour {
@@ -855,6 +901,7 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 					details["trapped_references"] = trap.Basicinfo.References
 				}
 				logDetails(details)
+				phpDelay(r, behaviour.Response, bodyLen)
 				writeTrapResponse(w, r, behaviour)
 				return
 			}
@@ -862,6 +909,7 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 
 		logDetails(buildLogDetails(r, ua, payload, false))
 		if fallback != nil {
+			phpDelay(r, fallback.Unmatched, bodyLen)
 			writeTrapResponse(w, r, Behaviour{Response: fallback.Unmatched})
 		}
 	})

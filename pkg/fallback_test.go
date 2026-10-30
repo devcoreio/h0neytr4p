@@ -121,3 +121,63 @@ func TestLoadFallbackRejectsBadFiles(t *testing.T) {
 		})
 	}
 }
+
+// timingFallbackFile writes a valid fallback with the given extra top-level
+// JSON (e.g. a Timing block) and clears the package fallback after the test.
+func timingFallbackFile(t *testing.T, extra string) string {
+	t.Helper()
+	t.Cleanup(func() { SetFallback(nil) })
+	return writeFallbackFile(t, `{
+  "Unmatched": {"StatusCode": 404, "Body": "<h1>Not Found</h1>", "Type": "string",
+                "Headers": {"Content-Type": "text/html"}}`+extra+`
+}`)
+}
+
+func TestLoadFallbackParsesTiming(t *testing.T) {
+	path := timingFallbackFile(t, `,
+  "Timing": {"PhpBaseMs": 6, "PhpJitterMs": 2, "PhpPerMBMs": 20}`)
+	fb, err := LoadFallback(path)
+	if err != nil {
+		t.Fatalf("LoadFallback() error = %v", err)
+	}
+	if want := (Timing{PhpBaseMs: 6, PhpJitterMs: 2, PhpPerMBMs: 20}); fb.Timing != want {
+		t.Fatalf("Timing = %+v, want %+v", fb.Timing, want)
+	}
+	if currentTiming() != fb.Timing {
+		t.Fatalf("currentTiming() = %+v, want the loaded Timing", currentTiming())
+	}
+}
+
+func TestLoadFallbackTimingOptional(t *testing.T) {
+	fb, err := LoadFallback(timingFallbackFile(t, ""))
+	if err != nil {
+		t.Fatalf("LoadFallback() error = %v", err)
+	}
+	if fb.Timing != (Timing{}) {
+		t.Fatalf("Timing = %+v, want zero", fb.Timing)
+	}
+	SetFallback(nil)
+	if currentTiming() != (Timing{}) {
+		t.Fatalf("currentTiming() with no fallback = %+v, want zero", currentTiming())
+	}
+}
+
+func TestLoadFallbackRejectsBadTiming(t *testing.T) {
+	for name, timing := range map[string]string{
+		"negative base":     `{"PhpBaseMs": -1}`,
+		"negative jitter":   `{"PhpBaseMs": 6, "PhpJitterMs": -1}`,
+		"negative per-MB":   `{"PhpBaseMs": 6, "PhpPerMBMs": -1}`,
+		"jitter above base": `{"PhpBaseMs": 6, "PhpJitterMs": 10}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadFallback(timingFallbackFile(t, `,
+  "Timing": `+timing))
+			if err == nil || !strings.Contains(err.Error(), "Timing") {
+				t.Fatalf("LoadFallback() error = %v, want a Timing error", err)
+			}
+			if fallback != nil {
+				t.Fatal("invalid fallback was installed")
+			}
+		})
+	}
+}
