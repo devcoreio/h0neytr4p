@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -333,6 +332,30 @@ func (p *requestPayload) overCap(body io.Reader, prefix []byte) {
 	p.data = string(prefix)
 }
 
+// prefixCapture is an io.Writer that keeps the first max bytes it sees and
+// silently discards the rest, so it can tee a body of any size.
+type prefixCapture struct {
+	buf []byte
+	max int
+}
+
+func (p *prefixCapture) Write(b []byte) (int, error) {
+	if room := p.max - len(p.buf); room > 0 {
+		if len(b) > room {
+			p.buf = append(p.buf, b[:room]...)
+		} else {
+			p.buf = append(p.buf, b...)
+		}
+	}
+	return len(b), nil
+}
+
+// teeBody tees a request body through a prefixCapture while keeping Close.
+type teeBody struct {
+	io.Reader
+	io.Closer
+}
+
 func newRequestPayload(r *http.Request) requestPayload {
 	return requestPayload{
 		params: flattenValues(r.URL.Query()),
@@ -350,13 +373,7 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 	// Over-cap bodies are never rejected (PHP answers 200 with empty
 	// superglobals); a declared oversize length skips parsing entirely.
 	if r.ContentLength > sizeLimit {
-		if contentType == "multipart/form-data" {
-			// Intentional asymmetry: multipart over-cap stores no raw prefix (only
-			// the payload_truncated flag); other types keep up to MaxStoredPayload.
-			payload.truncated = true
-		} else {
-			payload.overCap(r.Body, nil)
-		}
+		payload.overCap(r.Body, nil)
 		return payload, nil
 	}
 
@@ -373,17 +390,26 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 		payload.storeRaw(string(bodyBytes))
 		mergeParams(payload.params, parseJSONBodyParams(bodyBytes))
 	case "multipart/form-data":
-		r.Body = http.MaxBytesReader(w, r.Body, sizeLimit)
+		// The body is teed into a bounded prefix so evidence survives when the
+		// parser gives up. Go's part and header limits (multipartmaxparts=1000,
+		// multipartmaxheaders=10000) are deliberately left at their defaults:
+		// PHP's max_input_vars is 1000 too, the raw prefix already shows the
+		// shape of a flood, and a higher limit only buys heap for the attacker.
+		prefix := &prefixCapture{max: MaxStoredPayload}
+		limited := http.MaxBytesReader(w, r.Body, sizeLimit)
+		r.Body = teeBody{Reader: io.TeeReader(limited, prefix), Closer: limited}
 		if err := r.ParseMultipartForm(sizeLimit); err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				if r.MultipartForm != nil {
-					_ = r.MultipartForm.RemoveAll()
-				}
-				payload.truncated = true
-				return payload, nil
+			// Any parse failure (over cap, too many parts or headers, malformed
+			// boundary) mimics PHP past its limits: empty superglobals, normal
+			// response. Drain what is left so the prefix fills up and the
+			// connection stays reusable, as Apache would.
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
 			}
-			return payload, fmt.Errorf("parse multipart form: %w", err)
+			_, _ = io.Copy(io.Discard, r.Body)
+			log.Printf("multipart parse failed, kept %d-byte prefix: %v", len(prefix.buf), err)
+			payload.overCap(nil, prefix.buf)
+			return payload, nil
 		}
 		if r.MultipartForm == nil {
 			return payload, nil

@@ -175,3 +175,36 @@ func TestNewServerDisablesHTTP2(t *testing.T) {
 		t.Fatalf("Addr = %q", srv.Addr)
 	}
 }
+
+func TestServerManyPartMultipartNo413KeepsPrefix(t *testing.T) {
+	t.Setenv("GODEBUG", "multipartmaxparts=1000")
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	body, contentType := manyPartMultipart(t, 1500)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed (connection reset?): %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(respBody), "<h1>Not Found</h1>") {
+		t.Fatalf("status %d body %.120q, want the fallback persona page", resp.StatusCode, respBody)
+	}
+	// Apache reads the whole body and keeps the connection open; an unread
+	// body makes net/http add Connection: close, which is a tell.
+	if resp.Header.Get("Connection") == "close" || resp.Close {
+		t.Fatalf("response closed the connection on an under-cap body")
+	}
+	logContent := readTestLog(t, logPath)
+	for _, want := range []string{`"payload_truncated":"true"`, `"payload":"`, "PHP_SESSION_UPLOAD_PROGRESS"} {
+		if !strings.Contains(logContent, want) {
+			t.Fatalf("log missing %s: %.300s", want, logContent)
+		}
+	}
+}
