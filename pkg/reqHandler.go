@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -366,6 +367,51 @@ type teeBody struct {
 	io.Closer
 }
 
+// errOverCap is returned by capReader once a body runs past its cap.
+var errOverCap = errors.New("body exceeds cap")
+
+// capReader fails reads with errOverCap once more than limit bytes have passed
+// through it. Unlike http.MaxBytesReader it does not tell the server the body
+// was too large, so net/http never forces Connection: close and the handler
+// can still drain the remainder and keep the connection alive, as Apache does.
+type capReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func newCapReader(r io.Reader, limit int64) *capReader {
+	return &capReader{r: r, remaining: limit}
+}
+
+func (c *capReader) Read(p []byte) (int, error) {
+	if c.remaining < 0 {
+		return 0, errOverCap
+	}
+	// Ask for at most one byte past the cap: enough to detect the overrun
+	// without consuming far beyond it.
+	if int64(len(p)) > c.remaining+1 {
+		p = p[:c.remaining+1]
+	}
+	n, err := c.r.Read(p)
+	c.remaining -= int64(n)
+	if c.remaining < 0 {
+		return n, errOverCap
+	}
+	return n, err
+}
+
+// drainBody reads and discards up to limit bytes of body and returns how many
+// it drained. Apache reads a request body in full before answering, so the
+// connection stays reusable; the time spent is bounded by the server
+// ReadTimeout and the bytes by MaxDrainSize.
+func drainBody(body io.Reader, limit int64) int64 {
+	if body == nil {
+		return 0
+	}
+	n, _ := io.Copy(io.Discard, io.LimitReader(body, limit))
+	return n
+}
+
 func newRequestPayload(r *http.Request) requestPayload {
 	return requestPayload{
 		params: flattenValues(r.URL.Query()),
@@ -405,20 +451,24 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 		// multipartmaxheaders=10000) are deliberately left at their defaults:
 		// PHP's max_input_vars is 1000 too, the raw prefix already shows the
 		// shape of a flood, and a higher limit only buys heap for the attacker.
+		// capReader (not http.MaxBytesReader) enforces the cap so net/http is
+		// never told the body was too large and does not close the connection.
+		// r.Body is restored afterwards so the handler drains the remainder.
+		orig := r.Body
 		prefix := &prefixCapture{max: MaxStoredPayload}
-		limited := http.MaxBytesReader(w, r.Body, sizeLimit)
-		r.Body = teeBody{Reader: io.TeeReader(limited, prefix), Closer: limited}
+		capped := newCapReader(orig, sizeLimit)
+		r.Body = teeBody{Reader: io.TeeReader(capped, prefix), Closer: orig}
+		defer func() { r.Body = orig }()
 		if err := r.ParseMultipartForm(sizeLimit); err != nil {
 			// Any parse failure (over cap, too many parts or headers, malformed
 			// boundary) mimics PHP past its limits: empty superglobals, normal
-			// response. Drain what is left so the prefix fills up and the
-			// connection stays reusable, as Apache would.
+			// response. The parser may stop after one buffer, so the prefix is
+			// topped up from the body; the handler drains whatever is left.
 			if r.MultipartForm != nil {
 				_ = r.MultipartForm.RemoveAll()
 			}
-			_, _ = io.Copy(io.Discard, r.Body)
-			log.Printf("multipart parse failed, kept %d-byte prefix: %v", len(prefix.buf), err)
-			payload.overCap(nil, prefix.buf)
+			payload.overCap(orig, prefix.buf)
+			log.Printf("multipart parse failed, kept %d-byte prefix: %v", len(payload.data), err)
 			return payload, nil
 		}
 		if r.MultipartForm == nil {
@@ -666,6 +716,14 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 				log.Printf("Error processing payload: %v", err)
 			}
 		}
+		// Apache reads the whole body before answering and keeps the
+		// connection open; answering mid-upload makes net/http close it.
+		drained := drainBody(r.Body, MaxDrainSize)
+		bodyLen := r.ContentLength
+		if bodyLen < 0 {
+			bodyLen = drained
+		}
+		_ = bodyLen // consumed by the response-delay model (later task)
 
 		for _, trap := range trapConfig {
 			for _, behaviour := range trap.Behaviour {

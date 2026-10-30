@@ -3,6 +3,8 @@ package h0neytr4p
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -837,5 +839,34 @@ func TestStoredPayloadBoundedForLargeJSON(t *testing.T) {
 	}
 	if len(got.data) > MaxStoredPayload || !got.truncated {
 		t.Fatalf("stored %d bytes, truncated=%v", len(got.data), got.truncated)
+	}
+}
+
+func TestDrainBodyReadsUpToLimit(t *testing.T) {
+	n := drainBody(strings.NewReader(strings.Repeat("x", 1000)), 1000)
+	if n != 1000 {
+		t.Fatalf("drained %d, want 1000", n)
+	}
+	n = drainBody(strings.NewReader(strings.Repeat("x", 1000)), 100)
+	if n != 100 {
+		t.Fatalf("drained %d, want 100 (bounded)", n)
+	}
+	if drainBody(nil, 100) != 0 {
+		t.Fatal("nil body must drain 0")
+	}
+}
+
+func TestCapReaderReturnsErrOverCapPastLimit(t *testing.T) {
+	cr := newCapReader(strings.NewReader("abcdef"), 4)
+	got, err := io.ReadAll(cr)
+	if !errors.Is(err, errOverCap) {
+		t.Fatalf("err = %v, want errOverCap", err)
+	}
+	if len(got) > 5 {
+		t.Fatalf("read %d bytes past the cap", len(got))
+	}
+	cr = newCapReader(strings.NewReader("abcd"), 4)
+	if got, err := io.ReadAll(cr); err != nil || string(got) != "abcd" {
+		t.Fatalf("at-cap read = %q, %v", got, err)
 	}
 }

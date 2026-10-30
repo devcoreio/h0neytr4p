@@ -208,3 +208,132 @@ func TestServerManyPartMultipartNo413KeepsPrefix(t *testing.T) {
 		}
 	}
 }
+
+// countingReader counts the body bytes the client actually sent, so a test can
+// prove the server read the whole body: a server that answers early and closes
+// makes the client's write stop short of the body length.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+func postKeepAlive(t *testing.T, srv *httptest.Server, path, contentType string, body []byte, declareLength bool) (*http.Response, *countingReader) {
+	t.Helper()
+	return sendKeepAlive(t, srv, http.MethodPost, path, contentType, body, declareLength)
+}
+
+func sendKeepAlive(t *testing.T, srv *httptest.Server, method, path, contentType string, body []byte, declareLength bool) (*http.Response, *countingReader) {
+	t.Helper()
+	cr := &countingReader{r: bytes.NewReader(body)}
+	req, _ := http.NewRequest(method, srv.URL+path, io.NopCloser(cr))
+	if declareLength {
+		req.ContentLength = int64(len(body))
+	} else {
+		req.ContentLength = -1 // forces Transfer-Encoding: chunked
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Connection", "keep-alive")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed (server answered early?): %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp, cr
+}
+
+// assertDrainedKeepAlive checks Apache's behaviour: the whole body was read
+// before the answer and the connection was left open.
+func assertDrainedKeepAlive(t *testing.T, resp *http.Response, cr *countingReader, want int64) {
+	t.Helper()
+	if cr.n != want {
+		t.Fatalf("server read %d of %d body bytes", cr.n, want)
+	}
+	if resp.Close || resp.Header.Get("Connection") == "close" {
+		t.Fatalf("response closed the connection")
+	}
+}
+
+func overCapMultipart(t *testing.T) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormField("PHP_SESSION_UPLOAD_PROGRESS")
+	fw.Write(bytes.Repeat([]byte("A"), 9*1024*1024))
+	mw.Close()
+	return buf.Bytes(), mw.FormDataContentType()
+}
+
+func TestServerDeclaredOverCapMultipartIsDrainedKeepAlive(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	body, contentType := overCapMultipart(t)
+	resp, cr := postKeepAlive(t, srv, "/", contentType, body, true)
+	assertDrainedKeepAlive(t, resp, cr, int64(len(body)))
+	if logContent := readTestLog(t, logPath); !strings.Contains(logContent, `"payload_truncated":"true"`) {
+		t.Fatalf("declared over-cap multipart not flagged: %.300s", logContent)
+	}
+}
+
+func TestServerChunkedOverCapMultipartIsDrainedKeepAlive(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	body, contentType := overCapMultipart(t)
+	resp, cr := postKeepAlive(t, srv, "/", contentType, body, false)
+	assertDrainedKeepAlive(t, resp, cr, int64(len(body)))
+	if logContent := readTestLog(t, logPath); !strings.Contains(logContent, `"payload_truncated":"true"`) {
+		t.Fatalf("chunked over-cap multipart not flagged: %.300s", logContent)
+	}
+}
+
+func TestServerOverCapJSONIsDrainedKeepAlive(t *testing.T) {
+	configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	body := append([]byte(`{"a":"`), bytes.Repeat([]byte("A"), 9*1024*1024)...)
+	body = append(body, `"}`...)
+	resp, cr := postKeepAlive(t, srv, "/", "application/json", body, true)
+	assertDrainedKeepAlive(t, resp, cr, int64(len(body)))
+}
+
+func TestServerGetWithBodyIsDrainedKeepAlive(t *testing.T) {
+	configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	body := bytes.Repeat([]byte("x"), 1024*1024)
+	resp, cr := sendKeepAlive(t, srv, http.MethodGet, "/", "text/plain", body, true)
+	assertDrainedKeepAlive(t, resp, cr, int64(len(body)))
+}
+
+func TestServerMalformedMultipartKeepsWholePrefix(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	// The parser gives up after its first 4 KB buffer; the stored prefix must
+	// still hold the whole (under MaxStoredPayload) body, tail included.
+	body := append([]byte("no-boundary-here\r\n"), bytes.Repeat([]byte("B"), 30000)...)
+	body = append(body, "TAILMARK"...)
+	resp, cr := postKeepAlive(t, srv, "/", "multipart/form-data; boundary=XYZ", body, true)
+	assertDrainedKeepAlive(t, resp, cr, int64(len(body)))
+	if logContent := readTestLog(t, logPath); !strings.Contains(logContent, "TAILMARK") {
+		t.Fatalf("malformed multipart prefix lost the body tail: %.300s", logContent)
+	}
+}

@@ -52,6 +52,11 @@ const (
 	// oversized body cannot bloat Elasticsearch or process memory.
 	MaxStoredPayload = 64 * 1024
 
+	// MaxDrainSize bounds how much of a request body the handler reads and
+	// discards before answering. Apache reads the whole body and keeps the
+	// connection open; answering mid-upload makes Go close it, which is a tell.
+	MaxDrainSize int64 = 64 * 1024 * 1024
+
 	// T-Pot expects group-readable/group-writable runtime artifacts.
 	RuntimeDirMode  os.FileMode = 0775
 	RuntimeFileMode os.FileMode = 0775
