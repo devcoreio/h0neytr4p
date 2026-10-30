@@ -318,6 +318,16 @@ func (p *requestPayload) storeRaw(s string) {
 	p.data = s
 }
 
+// storeParameter keeps at most MaxStoredPayload bytes of the formatted body
+// params in the log entry; trap matching still sees the full values.
+func (p *requestPayload) storeParameter(s string) {
+	if len(s) > MaxStoredPayload {
+		s = s[:MaxStoredPayload]
+		p.truncated = true
+	}
+	p.parameter = s
+}
+
 // overCap mimics PHP past post_max_size: body superglobals stay empty, only a
 // bounded prefix of the raw body is kept, and the request is flagged.
 func (p *requestPayload) overCap(body io.Reader, prefix []byte) {
@@ -426,7 +436,7 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 			}
 		}
 		mergeParams(payload.params, bodyParams)
-		payload.parameter = formatParams(payloadParams)
+		payload.storeParameter(formatParams(payloadParams))
 
 		for _, files := range r.MultipartForm.File {
 			for _, fileHeader := range files {

@@ -201,3 +201,30 @@ func TestAllHandlerOctetStreamOverCapBounded(t *testing.T) {
 	}
 }
 
+func TestPayloadParameterBounded(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	req, _ := oversizedMultipartRequest(t, "/upload", 200*1024)
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"payload_parameter":"blob=`) || !strings.Contains(logContent, `"payload_truncated":"true"`) {
+		t.Fatalf("log missing bounded parameter or truncated flag: %.200s", logContent)
+	}
+	if len(logContent) > 2*MaxStoredPayload {
+		t.Fatalf("log entry %d bytes, payload_parameter not bounded", len(logContent))
+	}
+
+	req2, _ := oversizedMultipartRequest(t, "/upload", 200*1024)
+	got, err := captureRequestPayload(httptest.NewRecorder(), req2, newRequestPayload(req2))
+	if err != nil {
+		t.Fatalf("captureRequestPayload() error = %v", err)
+	}
+	if len(got.parameter) > MaxStoredPayload || !got.truncated {
+		t.Fatalf("parameter=%d bytes truncated=%v, want <=%d and truncated", len(got.parameter), got.truncated, MaxStoredPayload)
+	}
+	// Trap matching still sees the whole field value.
+	if len(got.params["blob"]) != 200*1024 {
+		t.Fatalf("in-memory param cut to %d bytes", len(got.params["blob"]))
+	}
+}

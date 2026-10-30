@@ -802,8 +802,10 @@ func TestAllHandlerCapturesMultipartAtBoundary(t *testing.T) {
 	if !strings.Contains(logContent, `"payload_parameter":"blob=`) {
 		t.Fatalf("params not parsed at boundary: %.300s", logContent)
 	}
-	if strings.Contains(logContent, `"payload_truncated"`) {
-		t.Fatalf("under-cap body flagged truncated")
+	// The field parses in full (trap matching sees it) but its stored copy
+	// is cut to MaxStoredPayload and flagged, so the log entry stays bounded.
+	if !strings.Contains(logContent, `"payload_truncated":"true"`) || len(logContent) > 2*MaxStoredPayload {
+		t.Fatalf("stored parameter not bounded: %d bytes", len(logContent))
 	}
 }
 
