@@ -684,6 +684,9 @@ type connCountKey struct{}
 
 type reqNumKey struct{}
 
+// maxKeepAliveRequests is Apache's MaxKeepAliveRequests default.
+const maxKeepAliveRequests = 100
+
 // requestNumber increments and returns the connection's request counter (1
 // for the first request); 1 when the connection has no counter.
 func requestNumber(r *http.Request) int32 {
@@ -728,11 +731,17 @@ func wantsKeepAlive(h http.Header) bool {
 // keep-alive response to frame it with a Content-Length (and Go would
 // otherwise close the connection and drop the Connection header), so set one
 // unless the trap did; bodyLen is the body a GET would carry, so HEAD reports
-// the same length.
+// the same length. Past MaxKeepAliveRequests (request 101 on a connection)
+// Apache answers Connection: close with no Keep-Alive header and closes; Go
+// closes the connection when the handler sets Connection: close.
 func applyApacheConnectionHeaders(w http.ResponseWriter, r *http.Request, n int32, bodyLen int) {
 	h := w.Header()
+	if n > maxKeepAliveRequests {
+		h.Set("Connection", "close")
+		return
+	}
 	if wantsKeepAlive(r.Header) {
-		h.Set("Keep-Alive", fmt.Sprintf("timeout=5, max=%d", 101-n))
+		h.Set("Keep-Alive", fmt.Sprintf("timeout=5, max=%d", maxKeepAliveRequests+1-n))
 		h.Set("Connection", "Keep-Alive")
 		if !r.ProtoAtLeast(1, 1) && h.Get("Content-Length") == "" {
 			h.Set("Content-Length", strconv.Itoa(bodyLen))

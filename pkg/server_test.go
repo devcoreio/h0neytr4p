@@ -500,3 +500,58 @@ func TestServerKeepAliveOnFallback404(t *testing.T) {
 		t.Errorf("Connection = %q", got)
 	}
 }
+
+func TestServerKeepAliveClosesAfterMaxRequests(t *testing.T) {
+	addr := startKeepAliveServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	// http.ReadResponse strips a close token from an HTTP/1.1 response's
+	// Connection header (it sets resp.Close instead), so keep the raw bytes of
+	// each response to check what went over the wire. Requests are sent one
+	// at a time, so the buffer holds exactly one response.
+	var raw bytes.Buffer
+	br := bufio.NewReader(io.TeeReader(conn, &raw))
+	req := rawRequest("GET", "/login/index.php", "HTTP/1.1", "keep-alive")
+	get := func(i int) (*http.Response, error) {
+		raw.Reset()
+		if _, err := io.WriteString(conn, req); err != nil {
+			return nil, err
+		}
+		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+		if err != nil {
+			return nil, err
+		}
+		_, err = io.Copy(io.Discard, resp.Body)
+		return resp, err
+	}
+
+	// MaxKeepAliveRequests 100: Apache counts max down to 1 on request 100,
+	// then answers request 101 with Connection: close and closes.
+	for i := 1; i <= 101; i++ {
+		resp, err := get(i)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		switch i {
+		case 100:
+			if got := resp.Header.Get("Keep-Alive"); got != "timeout=5, max=1" {
+				t.Fatalf("request 100 Keep-Alive = %q", got)
+			}
+		case 101:
+			head, _, _ := strings.Cut(raw.String(), "\r\n\r\n")
+			if !strings.Contains(head, "\r\nConnection: close\r\n") || !resp.Close {
+				t.Fatalf("request 101 not answered with Connection: close:\n%s", head)
+			}
+			if strings.Contains(head, "Keep-Alive:") {
+				t.Fatalf("request 101 carries a Keep-Alive header:\n%s", head)
+			}
+		}
+	}
+	if _, err := get(102); err == nil {
+		t.Fatal("request 102 succeeded; want the connection closed after request 101")
+	}
+}
