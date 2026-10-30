@@ -870,3 +870,40 @@ func TestCapReaderReturnsErrOverCapPastLimit(t *testing.T) {
 		t.Fatalf("at-cap read = %q, %v", got, err)
 	}
 }
+
+func TestRequestBodyLengthPrefersDeclaredLength(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("abc"))
+	r.ContentLength = 3
+	if got := requestBodyLength(r, 99); got != 3 {
+		t.Fatalf("declared length: got %d, want 3", got)
+	}
+	r.ContentLength = -1 // chunked: only the counted bytes are known
+	if got := requestBodyLength(r, 3072); got != 3072 {
+		t.Fatalf("chunked length: got %d, want 3072", got)
+	}
+}
+
+func TestCountingBodyCountsEveryReadAndDelegatesClose(t *testing.T) {
+	closed := false
+	cb := &countingBody{ReadCloser: closeTracker{Reader: strings.NewReader(strings.Repeat("x", 3072)), closed: &closed}}
+	// Capture reads part of the body, the drain reads the rest: both count.
+	if _, err := io.ReadFull(cb, make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	if n := drainBody(cb, MaxDrainSize); n != 2072 {
+		t.Fatalf("drained %d, want 2072", n)
+	}
+	if cb.n != 3072 {
+		t.Fatalf("counted %d, want 3072", cb.n)
+	}
+	if err := cb.Close(); err != nil || !closed {
+		t.Fatalf("Close not delegated: err=%v closed=%v", err, closed)
+	}
+}
+
+type closeTracker struct {
+	io.Reader
+	closed *bool
+}
+
+func (c closeTracker) Close() error { *c.closed = true; return nil }

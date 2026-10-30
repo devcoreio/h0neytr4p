@@ -337,3 +337,16 @@ func TestServerMalformedMultipartKeepsWholePrefix(t *testing.T) {
 		t.Fatalf("malformed multipart prefix lost the body tail: %.300s", logContent)
 	}
 }
+
+func TestServerChunkedSmallJSONIsDrainedKeepAlive(t *testing.T) {
+	configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	srv := startServer(t, nil)
+
+	// Under cap, so the capture step reads the whole body itself.
+	body := append([]byte(`{"a":"`), bytes.Repeat([]byte("A"), 3*1024)...)
+	body = append(body, `"}`...)
+	resp, cr := postKeepAlive(t, srv, "/", "application/json", body, false)
+	assertDrainedKeepAlive(t, resp, cr, int64(len(body)))
+}

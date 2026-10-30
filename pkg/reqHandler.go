@@ -412,6 +412,28 @@ func drainBody(body io.Reader, limit int64) int64 {
 	return n
 }
 
+// countingBody counts every byte read from a request body, by the capture step
+// and the drain alike, so a chunked body's real length is known.
+type countingBody struct {
+	io.ReadCloser
+	n int64
+}
+
+func (c *countingBody) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// requestBodyLength is the declared Content-Length, or for a chunked body the
+// number of bytes actually read from it.
+func requestBodyLength(r *http.Request, counted int64) int64 {
+	if r.ContentLength >= 0 {
+		return r.ContentLength
+	}
+	return counted
+}
+
 func newRequestPayload(r *http.Request) requestPayload {
 	return requestPayload{
 		params: flattenValues(r.URL.Query()),
@@ -708,6 +730,10 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 		ua := uaParser.Parse(r.Header.Get("User-Agent"))
 		payload := newRequestPayload(r)
 		isMatchedRequest := hasMatchingRequest(trapConfig, r.Method, r.URL.Path)
+		body := &countingBody{ReadCloser: r.Body}
+		if r.Body != nil {
+			r.Body = body
+		}
 
 		if isMatchedRequest || catchall {
 			capturedPayload, err := captureRequestPayload(w, r, payload)
@@ -718,11 +744,8 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 		}
 		// Apache reads the whole body before answering and keeps the
 		// connection open; answering mid-upload makes net/http close it.
-		drained := drainBody(r.Body, MaxDrainSize)
-		bodyLen := r.ContentLength
-		if bodyLen < 0 {
-			bodyLen = drained
-		}
+		drainBody(r.Body, MaxDrainSize)
+		bodyLen := requestBodyLength(r, body.n)
 		_ = bodyLen // consumed by the response-delay model (later task)
 
 		for _, trap := range trapConfig {
