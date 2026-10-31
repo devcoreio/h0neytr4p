@@ -13,7 +13,9 @@ import (
 // Capture-path contract for bodies the multipart parser cannot finish: the
 // request is answered with the normal persona page, logged once, flagged
 // payload_truncated, and a bounded raw prefix of the body is kept as evidence.
-// Body params stay empty, as PHP's superglobals do past its limits.
+// The leading form fields are re-read from that prefix (PHP keeps the first
+// max_input_vars), so a part-flood body still surfaces its real fields, while
+// a body with no complete part in the prefix recovers nothing.
 
 // manyPartMultipart returns a body whose first field is the upload-progress
 // marker followed by n empty fields (the CVE-2026-109618 "nested empty file"
@@ -78,9 +80,6 @@ func assertBodyNotDropped(t *testing.T, body []byte, contentType string, wantInP
 			t.Fatalf("log missing %s: %.300s", want, logContent)
 		}
 	}
-	if strings.Contains(logContent, `"payload_parameter"`) {
-		t.Fatalf("log merged body params for an unparseable body: %.300s", logContent)
-	}
 	if len(logContent) > 2*MaxStoredPayload {
 		t.Fatalf("log entry %d bytes, stored prefix not bounded", len(logContent))
 	}
@@ -92,9 +91,6 @@ func assertBodyNotDropped(t *testing.T, body []byte, contentType string, wantInP
 	got, err := captureRequestPayload(httptest.NewRecorder(), req2, newRequestPayload(req2))
 	if err != nil {
 		t.Fatalf("captureRequestPayload() error = %v, want nil (request must not be dropped)", err)
-	}
-	if len(got.params) != 0 {
-		t.Fatalf("body params merged: %d params", len(got.params))
 	}
 	if !got.truncated || len(got.data) == 0 || len(got.data) > MaxStoredPayload {
 		t.Fatalf("truncated=%v stored=%d bytes, want truncated and 1..%d bytes", got.truncated, len(got.data), MaxStoredPayload)
@@ -108,7 +104,12 @@ func TestAllHandlerManyPartMultipartNotDropped(t *testing.T) {
 	if len(body) >= MaxMultipartSize {
 		t.Fatalf("test body %d bytes is not under the byte cap", len(body))
 	}
-	assertBodyNotDropped(t, body, contentType, "PHP_SESSION_UPLOAD_PROGRESS")
+	got := assertBodyNotDropped(t, body, contentType, "PHP_SESSION_UPLOAD_PROGRESS")
+	// The upload-progress marker leads the body, so it is re-read from the
+	// prefix even though the overall parse failed.
+	if got.params["PHP_SESSION_UPLOAD_PROGRESS"] != "k" {
+		t.Fatalf("leading upload-progress field not recovered: %#v", got.params)
+	}
 }
 
 func TestAllHandlerMalformedMultipartNotDropped(t *testing.T) {
@@ -117,12 +118,18 @@ func TestAllHandlerMalformedMultipartNotDropped(t *testing.T) {
 	if got.data != string(body) {
 		t.Fatalf("prefix of a short unparseable body not kept whole: %q", got.data)
 	}
+	if len(got.params) != 0 {
+		t.Fatalf("unterminated single part should recover no params: %#v", got.params)
+	}
 }
 
 func TestAllHandlerHeaderFloodMultipartNotDropped(t *testing.T) {
 	t.Setenv("GODEBUG", "multipartmaxheaders=10000")
 	body, contentType := headerFloodMultipart(20000)
-	assertBodyNotDropped(t, body, contentType, "a.txt")
+	got := assertBodyNotDropped(t, body, contentType, "a.txt")
+	if len(got.params) != 0 {
+		t.Fatalf("header-flood body should recover no params: %#v", got.params)
+	}
 }
 
 func TestAllHandlerDeclaredOverCapMultipartKeepsPrefix(t *testing.T) {

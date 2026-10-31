@@ -974,3 +974,71 @@ func TestIsPHPResponseCaseInsensitive(t *testing.T) {
 		t.Fatal("response without X-Powered-By recognised as PHP")
 	}
 }
+
+func TestAllHandlerRecoversLeadingParamOnPartFlood(t *testing.T) {
+	logPath, _ := configureTestIO(t)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	// Variant B: the real field first, then a flood of empty parts that pushes
+	// the body past Go's 1000-part limit so ParseMultipartForm fails. The real
+	// field sits at the front, inside the 64 KB prefix the sensor keeps.
+	if err := mw.WriteField("PHP_SESSION_UPLOAD_PROGRESS", "sess_abc123"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1500; i++ {
+		if err := mw.WriteField("f", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	allHandler(nil, true).ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = 413, want non-413")
+	}
+	logContent := readTestLog(t, logPath)
+	if !strings.Contains(logContent, `"payload_truncated":"true"`) {
+		t.Fatalf("log missing payload_truncated: %.300s", logContent)
+	}
+	for _, want := range []string{`"payload_parameter":`, `PHP_SESSION_UPLOAD_PROGRESS=sess_abc123`} {
+		if !strings.Contains(logContent, want) {
+			t.Fatalf("recovered param missing %q", want)
+		}
+	}
+}
+
+func TestReparsePrefixParamsToleratesCutTail(t *testing.T) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	mw.WriteField("a", "1")
+	mw.WriteField("b", "2")
+	mw.WriteField("c", "3")
+	mw.Close()
+	full := buf.String()
+	// Cut the body mid-stream so the final part is incomplete, as the 64 KB
+	// prefix does to a real flood body.
+	got := reparsePrefixParams(mw.FormDataContentType(), full[:len(full)-10])
+	if got["a"] != "1" || got["b"] != "2" {
+		t.Fatalf("leading params not recovered from cut prefix: %#v", got)
+	}
+}
+
+func TestReparsePrefixParamsEmptyOnHeaderFlood(t *testing.T) {
+	boundary := "xBOUNDARYx"
+	var b strings.Builder
+	b.WriteString("--" + boundary + "\r\n")
+	b.WriteString(`Content-Disposition: form-data; name="x"` + "\r\n")
+	// Variant A: an unending run of header lines; the part header never ends
+	// within the prefix (and exceeds Go's 10000-header limit), so no complete
+	// part can be recovered.
+	for i := 0; i < 12000; i++ {
+		b.WriteString("a: b\r\n")
+	}
+	got := reparsePrefixParams("multipart/form-data; boundary="+boundary, b.String())
+	if len(got) != 0 {
+		t.Fatalf("variant A should recover nothing, got %#v", got)
+	}
+}

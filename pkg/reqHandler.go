@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -346,6 +347,53 @@ func (p *requestPayload) overCap(body io.Reader, prefix []byte) {
 	p.data = string(prefix)
 }
 
+// reparsePrefixParams recovers the leading form fields from the bounded raw
+// multipart prefix kept when the full parse failed. A flood body (variant B:
+// thousands of empty parts) carries its real fields up front, inside the 64 KB
+// prefix, so the first complete value parts are still readable even though the
+// whole body was not. This mirrors PHP keeping the first max_input_vars (1000)
+// variables and dropping the overflow, and lets the upload-progress trap fire
+// on these bodies. The prefix usually cuts the final part short, so a read
+// error ends the scan and the fields before it are kept; a header flood
+// (variant A) leaves no complete part in the prefix and yields nothing.
+func reparsePrefixParams(contentTypeHeader, prefix string) map[string]string {
+	_, params, err := mime.ParseMediaType(contentTypeHeader)
+	if err != nil {
+		return nil
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		return nil
+	}
+	mr := multipart.NewReader(strings.NewReader(prefix), boundary)
+	recovered := make(map[string]string)
+	const maxParts = 1000      // PHP max_input_vars; also bounds the scan
+	const maxValueBytes = 8192 // a field value is small; the flood is not
+	for i := 0; i < maxParts; i++ {
+		part, err := mr.NextPart()
+		if err != nil {
+			break // clean EOF, or the prefix cut the stream mid-part
+		}
+		name := part.FormName()
+		if name == "" || part.FileName() != "" {
+			_ = part.Close()
+			continue // only named value fields are form params
+		}
+		val, readErr := io.ReadAll(io.LimitReader(part, maxValueBytes))
+		_ = part.Close()
+		// Keep only a field whose value ended on a boundary; a read error
+		// means the prefix cut this part short (or the body never closes it),
+		// so the value is unreliable. Empty flood parts carry nothing.
+		if readErr != nil || len(val) == 0 {
+			continue
+		}
+		if _, seen := recovered[name]; !seen {
+			recovered[name] = string(val)
+		}
+	}
+	return recovered
+}
+
 // prefixCapture is an io.Writer that keeps the first max bytes it sees and
 // silently discards the rest, so it can tee a body of any size.
 type prefixCapture struct {
@@ -493,6 +541,13 @@ func captureRequestPayload(w http.ResponseWriter, r *http.Request, payload reque
 				_ = r.MultipartForm.RemoveAll()
 			}
 			payload.overCap(orig, prefix.buf)
+			// Recover the leading fields from the prefix so the
+			// upload-progress trap can still match and
+			// payload_parameter is populated on these bodies.
+			if recovered := reparsePrefixParams(r.Header.Get("Content-Type"), payload.data); len(recovered) > 0 {
+				mergeParams(payload.params, recovered)
+				payload.storeParameter(formatParams(recovered))
+			}
 			log.Printf("multipart parse failed, kept %d-byte prefix: %v", len(payload.data), err)
 			return payload, nil
 		}
