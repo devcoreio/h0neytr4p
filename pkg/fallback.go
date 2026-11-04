@@ -12,8 +12,63 @@ import (
 // the honeypot keep one consistent server persona on every path instead of
 // Go's empty 200.
 type Fallback struct {
-	Unmatched Response `json:"Unmatched"`
-	Timing    Timing   `json:"Timing"`
+	Unmatched Response      `json:"Unmatched"`
+	Timing    Timing        `json:"Timing"`
+	Methods   *MethodPolicy `json:"Methods,omitempty"`
+}
+
+// MethodPolicy is how Apache answers a method no trap matched. mod_php runs
+// any verb but TRACE on a PHP path (handled by the relaxed trap pass); on a
+// non-PHP path Apache's default handler judges the verb before the file:
+// a verb it never registered gets NotImplemented (501), TRACE gets Trace
+// (405, empty Allow), OPTIONS gets Options (200, Allow, empty body) and any
+// other registered verb it will not serve gets NotAllowed (405, Allow).
+// Registered overrides Apache 2.4's built-in registry; GET, HEAD, POST,
+// OPTIONS and TRACE always count as registered.
+type MethodPolicy struct {
+	Registered     []string `json:"Registered,omitempty"`
+	NotImplemented Response `json:"NotImplemented"`
+	NotAllowed     Response `json:"NotAllowed"`
+	Trace          Response `json:"Trace"`
+	Options        Response `json:"Options"`
+}
+
+// apacheRegisteredMethods is Apache 2.4's built-in method registry
+// (server/core.c ap_method_registry_init), the verbs that get 405 rather
+// than 501 when a handler will not serve them.
+var apacheRegisteredMethods = []string{
+	"GET", "PUT", "POST", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+	"PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK",
+	"VERSION-CONTROL", "CHECKOUT", "UNCHECKOUT", "CHECKIN", "UPDATE", "LABEL",
+	"REPORT", "MKWORKSPACE", "MKACTIVITY", "BASELINE-CONTROL", "MERGE",
+}
+
+// isRegistered reports whether Apache knows the verb (case-sensitive, as
+// Apache's lookup is).
+func (p *MethodPolicy) isRegistered(method string) bool {
+	switch method {
+	case "GET", "HEAD", "POST", "OPTIONS", "TRACE":
+		return true
+	}
+	list := p.Registered
+	if len(list) == 0 {
+		list = apacheRegisteredMethods
+	}
+	for _, m := range list {
+		if m == method {
+			return true
+		}
+	}
+	return false
+}
+
+// currentMethods returns the loaded fallback's method policy, or nil when
+// there is no fallback or it has no Methods section (legacy behaviour).
+func currentMethods() *MethodPolicy {
+	if fallback == nil {
+		return nil
+	}
+	return fallback.Methods
 }
 
 // Timing shapes how long PHP-generated responses (those carrying
@@ -52,6 +107,9 @@ func LoadFallback(path string) (*Fallback, error) {
 	if err := validateTiming(fb.Timing); err != nil {
 		return nil, fmt.Errorf("fallback %s: Timing: %w", path, err)
 	}
+	if err := validateMethods(fb.Methods); err != nil {
+		return nil, fmt.Errorf("fallback %s: %w", path, err)
+	}
 	SetFallback(fb)
 	return fb, nil
 }
@@ -73,6 +131,28 @@ func validateFallbackResponse(name string, resp Response) error {
 		}
 	}
 	return fmt.Errorf("%s: Headers must set Content-Type explicitly (Go would sniff one)", name)
+}
+
+// validateMethods checks every response of a Methods section the way the
+// Unmatched response is checked, except Options, whose empty body needs no
+// Content-Type (Apache sets one from the path's type, or none).
+func validateMethods(p *MethodPolicy) error {
+	if p == nil {
+		return nil
+	}
+	for name, resp := range map[string]Response{
+		"Methods.NotImplemented": p.NotImplemented,
+		"Methods.NotAllowed":     p.NotAllowed,
+		"Methods.Trace":          p.Trace,
+	} {
+		if err := validateFallbackResponse(name, resp); err != nil {
+			return err
+		}
+	}
+	if p.Options.Statuscode == 0 {
+		return fmt.Errorf("Methods.Options: StatusCode is missing or 0")
+	}
+	return nil
 }
 
 // validateTiming rejects negative values and a jitter wider than the base,

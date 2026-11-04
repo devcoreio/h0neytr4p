@@ -181,3 +181,91 @@ func TestLoadFallbackRejectsBadTiming(t *testing.T) {
 		})
 	}
 }
+
+// methodsFallbackFile writes a valid fallback whose Methods section is the
+// given JSON object body and clears the package fallback after the test.
+func methodsFallbackFile(t *testing.T, methods string) string {
+	t.Helper()
+	return timingFallbackFile(t, `,
+  "Methods": `+methods)
+}
+
+const testMethodsJSON = `{
+    "NotImplemented": {"StatusCode": 501, "Type": "string", "Body": "<p>{{req_method}} not supported for current URL.<br />",
+                       "Headers": {"Content-Type": "text/html; charset=iso-8859-1", "Allow": "GET,POST,OPTIONS,HEAD", "Connection": "close"}},
+    "NotAllowed":     {"StatusCode": 405, "Type": "string", "Body": "<p>The requested method {{req_method}} is not allowed for this URL.</p>",
+                       "Headers": {"Content-Type": "text/html; charset=iso-8859-1", "Allow": "GET,POST,OPTIONS,HEAD"}},
+    "Trace":          {"StatusCode": 405, "Type": "string", "Body": "<p>The requested method {{req_method}} is not allowed for this URL.</p>",
+                       "Headers": {"Content-Type": "text/html; charset=iso-8859-1", "Allow": ""}},
+    "Options":        {"StatusCode": 200, "Type": "string", "Body": "",
+                       "Headers": {"Allow": "GET,POST,OPTIONS,HEAD", "Content-Length": "0"}}
+  }`
+
+func TestLoadFallbackParsesMethods(t *testing.T) {
+	fb, err := LoadFallback(methodsFallbackFile(t, testMethodsJSON))
+	if err != nil {
+		t.Fatalf("LoadFallback() error = %v", err)
+	}
+	if fb.Methods == nil {
+		t.Fatal("Methods not parsed")
+	}
+	if fb.Methods.NotImplemented.Statuscode != 501 || fb.Methods.NotAllowed.Statuscode != 405 ||
+		fb.Methods.Trace.Statuscode != 405 || fb.Methods.Options.Statuscode != 200 {
+		t.Fatalf("Methods statuses parsed wrong: %+v", fb.Methods)
+	}
+	if got := convertMap(fb.Methods.Trace.Headers)["Allow"]; got != "" {
+		t.Fatalf("Trace Allow = %q, want empty", got)
+	}
+	for method, want := range map[string]bool{"PUT": true, "TRACE": true, "GET": true, "PROPFIND": true, "DOOD": false, "get": false} {
+		if got := fb.Methods.isRegistered(method); got != want {
+			t.Errorf("isRegistered(%q) = %v, want %v", method, got, want)
+		}
+	}
+	if currentMethods() != fb.Methods {
+		t.Fatal("currentMethods() did not return the loaded policy")
+	}
+}
+
+func TestLoadFallbackMethodsRegisteredOverride(t *testing.T) {
+	fb, err := LoadFallback(methodsFallbackFile(t, strings.Replace(testMethodsJSON, `"NotImplemented"`, `"Registered": ["GET", "BREW"], "NotImplemented"`, 1)))
+	if err != nil {
+		t.Fatalf("LoadFallback() error = %v", err)
+	}
+	if !fb.Methods.isRegistered("BREW") || fb.Methods.isRegistered("PUT") {
+		t.Fatalf("Registered override not honoured: BREW=%v PUT=%v", fb.Methods.isRegistered("BREW"), fb.Methods.isRegistered("PUT"))
+	}
+	for _, always := range []string{"GET", "HEAD", "POST", "OPTIONS", "TRACE"} {
+		if !fb.Methods.isRegistered(always) {
+			t.Errorf("%s must always count as registered", always)
+		}
+	}
+}
+
+func TestLoadFallbackMethodsOptional(t *testing.T) {
+	fb, err := LoadFallback(timingFallbackFile(t, ""))
+	if err != nil {
+		t.Fatalf("LoadFallback() error = %v", err)
+	}
+	if fb.Methods != nil || currentMethods() != nil {
+		t.Fatalf("Methods = %+v, currentMethods() = %+v; want nil without a Methods section", fb.Methods, currentMethods())
+	}
+}
+
+func TestLoadFallbackRejectsBadMethods(t *testing.T) {
+	cases := map[string]struct{ json, want string }{
+		"zero status":     {strings.Replace(testMethodsJSON, `"StatusCode": 501`, `"StatusCode": 0`, 1), "Methods.NotImplemented"},
+		"no Content-Type": {strings.Replace(testMethodsJSON, `"Content-Type": "text/html; charset=iso-8859-1", "Allow": "GET,POST,OPTIONS,HEAD"}},`, `"Allow": "GET,POST,OPTIONS,HEAD"}},`, 1), "Content-Type"},
+		"missing Trace":   {strings.Replace(testMethodsJSON, `"Trace"`, `"Tracer"`, 1), "Trace"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadFallback(methodsFallbackFile(t, c.json))
+			if err == nil {
+				t.Fatalf("LoadFallback accepted a Methods section with %s", name)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error = %q, want it to mention %q", err, c.want)
+			}
+		})
+	}
+}
