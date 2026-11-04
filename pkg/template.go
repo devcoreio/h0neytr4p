@@ -100,8 +100,9 @@ func requestHasCookie(r *http.Request, name string) bool {
 //	{{req_remote_port}}  client port
 //	{{req_ua}}           User-Agent header
 //	{{req_accept}}       Accept header
+//	{{req_method}}       request method verbatim (DOOD stays DOOD)
 //	{{req_time}}         unix seconds; {{req_time_float}} with 4 decimals
-var requestToken = regexp.MustCompile(`\{\{(req_host|req_port|req_ip|req_remote_port|req_ua|req_accept|req_time|req_time_float)\}\}`)
+var requestToken = regexp.MustCompile(`\{\{(req_host|req_port|req_ip|req_remote_port|req_ua|req_accept|req_method|req_time|req_time_float)\}\}`)
 
 // RenderRequestTemplate substitutes the request-derived tokens in s.
 func RenderRequestTemplate(s string, r *http.Request) string {
@@ -129,6 +130,8 @@ func RenderRequestTemplate(s string, r *http.Request) string {
 			v = r.Header.Get("User-Agent")
 		case "req_accept":
 			v = r.Header.Get("Accept")
+		case "req_method":
+			v = r.Method
 		case "req_time":
 			v = strconv.FormatInt(now.Unix(), 10)
 		case "req_time_float":

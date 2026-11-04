@@ -168,3 +168,11 @@ func TestWriteTrapResponseSupportsSeveralConditionalCookies(t *testing.T) {
 		t.Fatalf("with MDL_SSP_SessID present, Set-Cookie = %q; want MoodleSession and lang only", got)
 	}
 }
+
+func TestRenderRequestTemplateMethod(t *testing.T) {
+	r := httptest.NewRequest("DOOD", "/x", nil)
+	got := RenderRequestTemplate("<p>{{req_method}} not supported for current URL.<br />", r)
+	if want := "<p>DOOD not supported for current URL.<br />"; got != want {
+		t.Fatalf("RenderRequestTemplate = %q, want %q", got, want)
+	}
+}
