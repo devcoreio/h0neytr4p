@@ -131,6 +131,7 @@ The filename is the MD5 hash of the captured file content. Runtime directories a
 | `-key` | `Default` | `app.key` | TLS key file |
 | `-catchall` | `true` | `false` | Capture payloads for all requests, not only known trap method/path combinations |
 | `-wildcard` | `false` | `true` | Load all traps on ports `80` and `443` |
+| `-fallback` | (empty) | `fallback.json` in the persona image | JSON describing the answers for requests no trap matches; empty keeps the legacy empty 200 |
 | `-verbose` | `true` | `true` | Print log summaries to stdout |
 
 With `-wildcard=true`, every trap is loaded on both port `80` and port `443`, regardless of the port defined in the trap file. With `-wildcard=false`, traps are loaded only on their configured `BasicInfo.Port`.
@@ -138,6 +139,42 @@ With `-wildcard=true`, every trap is loaded on both port `80` and port `443`, re
 The Docker image uses `-wildcard=true` by default, so all bundled traps are available through the container's `80` and `443` listeners. Host-side aliases in `docker-compose.yml`, such as `2087:443`, do not create additional listeners inside h0neytr4p.
 
 With `-catchall=false`, payloads are captured only if the request method and path match at least one configured trap. With `-catchall=true`, payloads are captured even for unmatched requests.
+
+## Fallback Responses
+
+`-fallback=fallback.json` gives the honeypot one consistent server persona on every request no trap matches, instead of Go's empty `200`. The file has three sections; only `Unmatched` is required.
+
+```json
+{
+  "Unmatched": {"StatusCode": 404, "Type": "file", "Body": "traps/assets/apache/404.html",
+                "Headers": {"Server": "Apache/2.4.58 (Ubuntu)", "Content-Type": "text/html; charset=iso-8859-1"}},
+  "Timing":    {"PhpBaseMs": 6, "PhpJitterMs": 2, "PhpPerMBMs": 20},
+  "Methods": {
+    "Registered":     ["GET", "PUT", "POST", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "PROPFIND"],
+    "NotImplemented": {"StatusCode": 501, "Type": "file", "Body": "traps/assets/apache/501.html",
+                       "Headers": {"Server": "Apache/2.4.58 (Ubuntu)", "Content-Type": "text/html; charset=iso-8859-1",
+                                   "Allow": "GET,POST,OPTIONS,HEAD", "Connection": "close"}},
+    "NotAllowed":     {"StatusCode": 405, "Type": "file", "Body": "traps/assets/apache/405.html",
+                       "Headers": {"Server": "Apache/2.4.58 (Ubuntu)", "Content-Type": "text/html; charset=iso-8859-1",
+                                   "Allow": "GET,POST,OPTIONS,HEAD"}},
+    "Trace":          {"StatusCode": 405, "Type": "file", "Body": "traps/assets/apache/405.html",
+                       "Headers": {"Server": "Apache/2.4.58 (Ubuntu)", "Content-Type": "text/html; charset=iso-8859-1", "Allow": ""}},
+    "Options":        {"StatusCode": 200, "Type": "string", "Body": "",
+                       "Headers": {"Server": "Apache/2.4.58 (Ubuntu)", "Allow": "GET,POST,OPTIONS,HEAD", "Content-Length": "0"}},
+    "ContentTypes":   {".ico": "image/vnd.microsoft.icon"}
+  }
+}
+```
+
+- `Unmatched`: the response for a request no trap matches. `Content-Type` must be set explicitly (Go would sniff one).
+- `Timing`: how long responses carrying `X-Powered-By` wait before they are written, so a PHP page costs more than a static 404 (base + jitter + per-MB of multipart body). Zero disables.
+- `Methods`: how Apache answers a verb no trap matched. Omit the section to keep the legacy behaviour (every miss is `Unmatched`). With it, a request that matches no trap exactly is resolved in this order:
+  1. `TRACE` → `Trace` on every path (Apache rejects it before any handler).
+  2. A path with a GET trap whose response carries `X-Powered-By` is a PHP page: any other verb (POST, OPTIONS, PUT, `DOOD`…) serves that GET behaviour, as mod_php runs the script whatever the verb. HEAD keeps its GET semantics and is never served this way.
+  3. A path with a `.php` segment and no such trap is a missing script: `Unmatched` for every verb.
+  4. Any other path is judged on the verb before the file, as Apache's default handler does: GET/HEAD/POST → `Unmatched`; `OPTIONS` → `Options` with the `Content-Type` of the matching asset trap, else `ContentTypes[ext]`, else Go's MIME table, else none; a verb not in `Registered` (Apache 2.4's built-in registry when omitted; GET, HEAD, POST, OPTIONS and TRACE always count) → `NotImplemented`; any other registered verb → `NotAllowed`.
+
+Bodies are captured on every verb except GET, HEAD, TRACE and CONNECT. Response bodies and header values may use the request tokens (`{{req_method}}`, `{{req_host}}`, `{{req_port}}`, `{{req_ua}}`, …), so `501.html` can say `DOOD not supported for current URL.` the way Apache does. Every log line carries `method_route`: `exact`, `php-any-method`, `not-implemented`, `not-allowed`, `trace`, `options` or `unmatched`.
 
 ## Logs
 
