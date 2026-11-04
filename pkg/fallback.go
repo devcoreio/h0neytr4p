@@ -31,6 +31,10 @@ type MethodPolicy struct {
 	NotAllowed     Response `json:"NotAllowed"`
 	Trace          Response `json:"Trace"`
 	Options        Response `json:"Options"`
+	// ContentTypes maps a path extension (".ico") to the Content-Type Apache
+	// puts on an OPTIONS answer for a path with no trap; a trap's own
+	// Content-Type wins, Go's MIME table is the last resort.
+	ContentTypes map[string]string `json:"ContentTypes,omitempty"`
 }
 
 // apacheRegisteredMethods is Apache 2.4's built-in method registry

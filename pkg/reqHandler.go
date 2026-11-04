@@ -206,12 +206,15 @@ func requestContentType(r *http.Request) string {
 	return normalizeContentType(r.Header.Get("Content-Type"))
 }
 
+// isPayloadMethod reports whether a request body is read and captured.
+// Apache hands any verb but TRACE to mod_php, which reads the body whatever
+// the verb, so everything except GET, HEAD, TRACE and CONNECT counts.
 func isPayloadMethod(method string) bool {
 	switch method {
-	case http.MethodPost, http.MethodPut, http.MethodDelete:
-		return true
-	default:
+	case http.MethodGet, http.MethodHead, http.MethodTrace, http.MethodConnect:
 		return false
+	default:
+		return true
 	}
 }
 
@@ -662,7 +665,7 @@ func hasMatchingRequest(trapConfig []Trap, method string, path string) bool {
 			}
 		}
 	}
-	return false
+	return currentMethods() != nil && method != http.MethodHead && hasPHPPageBehaviour(trapConfig, path)
 }
 
 func headerContainsMatch(ruleHeaders map[string][]string, requestHeaders http.Header) bool {
@@ -908,6 +911,147 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 	}
 }
 
+// Method routes, logged as method_route so a Kibana search can count how
+// scanners probe verbs: exact is today's trap match; the rest are how Apache
+// answers a verb no trap matched (see MethodPolicy).
+const (
+	routeExact          = "exact"
+	routePHPAny         = "php-any-method"  // mod_php ran the page for a non-GET verb
+	routeNotImplemented = "not-implemented" // 501: unregistered verb on a non-PHP path
+	routeNotAllowed     = "not-allowed"     // 405: registered verb Apache will not serve on a non-PHP path
+	routeTrace          = "trace"           // 405 with an empty Allow, any path
+	routeOptions        = "options"         // 200 Allow on a non-PHP path
+	routeUnmatched      = "unmatched"
+)
+
+// firstMatch returns the first behaviour whose method (as given), URL,
+// proto, headers and params all match the request. phpOnly limits it to
+// behaviours whose response PHP would have generated.
+func firstMatch(trapConfig []Trap, r *http.Request, payload requestPayload, method string, phpOnly bool) (Trap, Behaviour, bool) {
+	for _, trap := range trapConfig {
+		for _, behaviour := range trap.Behaviour {
+			if !methodMatches(behaviour.Request.Method, method) || !match(behaviour.Request.URL, r.URL.Path) {
+				continue
+			}
+			if phpOnly && !isPHPResponse(behaviour.Response) {
+				continue
+			}
+			protoMatch := CheckProto(behaviour.Request.Proto, r.Proto)
+			headerMatch := CheckHeaders(convertMap(behaviour.Request.Headers), r.Header)
+			paramMatch := CheckParams(convertMap(behaviour.Request.Params), payload.params)
+			containsMatch := headerContainsMatch(behaviour.Request.HeaderContains, r.Header)
+			if !protoMatch || (!(headerMatch && paramMatch) && !containsMatch) {
+				continue
+			}
+			return trap, behaviour, true
+		}
+	}
+	return Trap{}, Behaviour{}, false
+}
+
+// hasPHPPageBehaviour reports whether some GET behaviour on the path answers
+// as PHP (X-Powered-By): the path is a PHP page the persona serves, which
+// mod_php would run for any verb.
+func hasPHPPageBehaviour(trapConfig []Trap, path string) bool {
+	for _, trap := range trapConfig {
+		for _, behaviour := range trap.Behaviour {
+			if behaviour.Request.Method == http.MethodGet && match(behaviour.Request.URL, path) && isPHPResponse(behaviour.Response) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasPHPSegment reports whether mod_php handles the path: some segment ends
+// in .php (so /theme/image.php/boost/... with PATH_INFO counts).
+func hasPHPSegment(path string) bool {
+	for _, seg := range strings.Split(path, "/") {
+		if strings.HasSuffix(seg, ".php") {
+			return true
+		}
+	}
+	return false
+}
+
+// optionsContentType is the Content-Type Apache puts on an OPTIONS answer for
+// a non-PHP path: the file's type. The persona's own asset trap knows it;
+// otherwise the policy's extension map, then Go's table without parameters;
+// empty (header omitted) when nothing knows, as Apache does for /nope.
+func optionsContentType(policy *MethodPolicy, trapConfig []Trap, path string) string {
+	for _, trap := range trapConfig {
+		for _, behaviour := range trap.Behaviour {
+			if behaviour.Request.Method != http.MethodGet || !match(behaviour.Request.URL, path) || isPHPResponse(behaviour.Response) {
+				continue
+			}
+			for key, value := range convertMap(behaviour.Response.Headers) {
+				if strings.EqualFold(key, "Content-Type") {
+					return value
+				}
+			}
+		}
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == "" {
+		return ""
+	}
+	if ct, ok := policy.ContentTypes[ext]; ok {
+		return ct
+	}
+	ct, _, _ := strings.Cut(mime.TypeByExtension(ext), ";")
+	return strings.TrimSpace(ct)
+}
+
+// methodFallback is how Apache answers a request no trap matched exactly.
+// A PHP page the persona serves runs for any verb but TRACE; a missing PHP
+// script is 404 for every verb; a non-PHP path is judged on the verb before
+// the file: 501 unregistered, 200 OPTIONS, 405 other registered verbs, and
+// only GET/HEAD/POST fall through to the 404. Without a Methods policy
+// everything is the legacy Unmatched.
+func methodFallback(policy *MethodPolicy, trapConfig []Trap, r *http.Request, payload requestPayload) (Trap, Behaviour, string) {
+	unmatched := Behaviour{Response: fallback.Unmatched}
+	if policy == nil {
+		return Trap{}, unmatched, routeUnmatched
+	}
+	if r.Method == http.MethodTrace {
+		return Trap{}, Behaviour{Response: policy.Trace}, routeTrace
+	}
+	if r.Method != http.MethodHead {
+		if trap, behaviour, ok := firstMatch(trapConfig, r, payload, http.MethodGet, true); ok {
+			return trap, behaviour, routePHPAny
+		}
+	}
+	if hasPHPSegment(r.URL.Path) || hasPHPPageBehaviour(trapConfig, r.URL.Path) {
+		return Trap{}, unmatched, routeUnmatched
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodPost:
+		return Trap{}, unmatched, routeUnmatched
+	case http.MethodOptions:
+		resp := policy.Options
+		resp.Headers = convertMapInterface(convertMap(resp.Headers))
+		if ct := optionsContentType(policy, trapConfig, r.URL.Path); ct != "" {
+			resp.Headers["Content-Type"] = ct
+		}
+		return Trap{}, Behaviour{Response: resp}, routeOptions
+	}
+	if !policy.isRegistered(r.Method) {
+		return Trap{}, Behaviour{Response: policy.NotImplemented}, routeNotImplemented
+	}
+	return Trap{}, Behaviour{Response: policy.NotAllowed}, routeNotAllowed
+}
+
+// convertMapInterface copies a string map into the header map shape a
+// Response carries, so a per-request header can be added without touching
+// the loaded policy.
+func convertMapInterface(m map[string]string) map[string]interface{} {
+	out := make(map[string]interface{}, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // Passing `trapConfig` parameter so each instance can handle its own traps independently.
 func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -933,40 +1077,30 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 		drainBody(r.Body, MaxDrainSize)
 		bodyLen := requestBodyLength(r, body.n)
 
-		for _, trap := range trapConfig {
-			for _, behaviour := range trap.Behaviour {
-				if !methodMatches(behaviour.Request.Method, r.Method) || !match(behaviour.Request.URL, r.URL.Path) {
-					continue
-				}
-
-				protoMatch := CheckProto(behaviour.Request.Proto, r.Proto)
-				headerMatch := CheckHeaders(convertMap(behaviour.Request.Headers), r.Header)
-				paramMatch := CheckParams(convertMap(behaviour.Request.Params), payload.params)
-				containsMatch := headerContainsMatch(behaviour.Request.HeaderContains, r.Header)
-				if !protoMatch || (!(headerMatch && paramMatch) && !containsMatch) {
-					continue
-				}
-
-				details := buildLogDetails(r, ua, payload, true)
-				details["trapped_for"] = trap.Basicinfo.Name
-				if trap.Basicinfo.RiskRating != "" {
-					details["trapped_risk_rating"] = trap.Basicinfo.RiskRating
-				}
-				if trap.Basicinfo.References != "" {
-					details["trapped_references"] = trap.Basicinfo.References
-				}
-				logDetails(details)
-				phpDelay(r, behaviour.Response, bodyLen)
-				writeTrapResponse(w, r, behaviour)
+		trap, behaviour, ok := firstMatch(trapConfig, r, payload, r.Method, false)
+		route := routeExact
+		if !ok {
+			if fallback == nil {
+				logDetails(buildLogDetails(r, ua, payload, false))
 				return
 			}
+			trap, behaviour, route = methodFallback(currentMethods(), trapConfig, r, payload)
 		}
-
-		logDetails(buildLogDetails(r, ua, payload, false))
-		if fallback != nil {
-			phpDelay(r, fallback.Unmatched, bodyLen)
-			writeTrapResponse(w, r, Behaviour{Response: fallback.Unmatched})
+		trapped := route == routeExact || route == routePHPAny
+		details := buildLogDetails(r, ua, payload, trapped)
+		details["method_route"] = route
+		if trapped {
+			details["trapped_for"] = trap.Basicinfo.Name
+			if trap.Basicinfo.RiskRating != "" {
+				details["trapped_risk_rating"] = trap.Basicinfo.RiskRating
+			}
+			if trap.Basicinfo.References != "" {
+				details["trapped_references"] = trap.Basicinfo.References
+			}
 		}
+		logDetails(details)
+		phpDelay(r, behaviour.Response, bodyLen)
+		writeTrapResponse(w, r, behaviour)
 	})
 }
 
