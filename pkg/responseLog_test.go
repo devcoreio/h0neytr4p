@@ -199,3 +199,34 @@ func TestAllHandlerLogLineIsWrittenOnce(t *testing.T) {
 		t.Errorf("log has %d lines, want 1:\n%s", n, logLine)
 	}
 }
+
+func TestAllHandlerLogsEvenWhenResponseWritePanics(t *testing.T) {
+	// A trap with an out-of-range status makes net/http (and httptest) panic in
+	// WriteHeader. The request's line must still reach the log.
+	trap := Trap{
+		Basicinfo: BasicInfo{Name: "bad-status", Port: "80"},
+		Behaviour: []Behaviour{{
+			Request:  Request{URL: "/bad", Method: http.MethodGet, Headers: map[string]interface{}{}},
+			Response: Response{Statuscode: 1000, Body: "x", Type: "string", Headers: map[string]interface{}{}},
+		}},
+	}
+	logPath, _ := configureTestIO(t)
+	req := httptest.NewRequest(http.MethodGet, "/bad", nil)
+	panicked := false
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				panicked = true
+			}
+		}()
+		allHandler([]Trap{trap}, true).ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	if !panicked {
+		t.Fatal("expected WriteHeader(1000) to panic")
+	}
+	logLine := readTestLog(t, logPath)
+	mustContain(t, logLine, `"request_uri":"/bad"`, `"response_status":"1000"`, `"response_bytes":"0"`, `"response_source":"inline"`)
+	if n := strings.Count(logLine, "\n"); n != 1 {
+		t.Errorf("log has %d lines, want 1", n)
+	}
+}

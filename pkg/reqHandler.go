@@ -1147,11 +1147,16 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 			}
 		}
 		// The line is written after the response so it records what the
-		// client actually received.
-		delay := phpDelay(r, behaviour.Response, bodyLen)
+		// client actually received. It is deferred so a panic while answering
+		// (net/http recovers it per connection) still leaves the request's
+		// line on disk with whatever the recorder saw.
+		var delay time.Duration
+		defer func() {
+			mergeDetails(details, responseDetails(rr, rr.Header(), responseSource(behaviour, route), started, delay))
+			logDetails(details)
+		}()
+		delay = phpDelay(r, behaviour.Response, bodyLen)
 		writeTrapResponse(w, r, behaviour)
-		mergeDetails(details, responseDetails(rr, rr.Header(), responseSource(behaviour, route), started, delay))
-		logDetails(details)
 	})
 }
 
