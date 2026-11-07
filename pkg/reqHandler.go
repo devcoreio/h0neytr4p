@@ -851,11 +851,52 @@ func sampledJitter(t Timing) float64 {
 
 // phpDelay sleeps for the response's PHP-shaped delay. It runs after the
 // body drain: Apache reads the request body, then PHP runs the page.
-func phpDelay(r *http.Request, resp Response, bodyLen int64) {
+// phpDelay applies the PHP-timing sleep for this response and returns the
+// duration it slept (0 when no timing is configured or none applies).
+func phpDelay(r *http.Request, resp Response, bodyLen int64) time.Duration {
 	t := currentTiming()
 	if d := responseDelay(resp, requestContentType(r), bodyLen, t, sampledJitter(t)); d > 0 {
 		time.Sleep(d)
+		return d
 	}
+	return 0
+}
+
+// responseSource names what answered the request: the trap response file for
+// a file-backed trap, "inline" for an inline body, "fallback:<route>" for a
+// method/unmatched fallback answer. "none" is used by the caller when no
+// fallback is configured and nothing matched.
+func responseSource(behaviour Behaviour, route string) string {
+	if route != routeExact && route != routePHPAny {
+		return "fallback:" + route
+	}
+	if behaviour.Response.Type == "file" {
+		return behaviour.Response.Body
+	}
+	return "inline"
+}
+
+// responseDetails builds the response_* log fields from what the recorder
+// saw and the headers the handler set. Header flattening mirrors
+// GetFlatHeaders: lower-cased name, multiple values joined with ", ".
+func responseDetails(rr *responseRecorder, h http.Header, source string, started time.Time, delay time.Duration) map[string]string {
+	d := map[string]string{
+		"response_status":   strconv.Itoa(rr.Status()),
+		"response_bytes":    strconv.FormatInt(rr.Bytes(), 10),
+		"response_ms":       strconv.FormatInt(time.Since(started).Milliseconds(), 10),
+		"response_delay_ms": strconv.FormatInt(delay.Milliseconds(), 10),
+		"response_source":   source,
+	}
+	if rr.Bytes() > 0 {
+		d["response_sha256"] = rr.SHA256()
+	}
+	for key, values := range h {
+		if len(values) == 0 {
+			continue
+		}
+		d["response_header_"+strings.ToLower(key)] = strings.Join(values, ", ")
+	}
+	return d
 }
 
 func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behaviour) {
