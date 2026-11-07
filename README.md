@@ -198,6 +198,16 @@ Each request produces one JSON object per line. A trapped request includes field
 
 Additional fields are added for request headers, cookies, user-agent details, trap references, and risk rating when available.
 
+The line is written after the response has been sent, so it also records the response side of the exchange:
+
+- `response_status` — the status code actually written (Go's implicit `200` when the handler wrote nothing).
+- `response_bytes` — body bytes written; `0` for HEAD and header-only answers.
+- `response_sha256` — hex SHA-256 of the body bytes written; omitted when `response_bytes` is `0`.
+- `response_header_<name>` — one field per header the handler set, name lower-cased, multiple values joined with `", "` (the same flattening as the request's `header_*` fields). Headers net/http adds on its own (Date, computed Content-Length, Transfer-Encoding, sniffed Content-Type) are not included.
+- `response_ms` — milliseconds from handler entry to the end of the body write.
+- `response_delay_ms` — milliseconds the PHP timing model slept before answering; `0` when none.
+- `response_source` — what answered: the trap response file path, `inline` for an inline body, `fallback:<method_route>` for a fallback answer, or `none` when no fallback is configured and nothing matched.
+
 ## Payload Capture
 
 Payload capture currently handles:

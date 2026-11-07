@@ -1096,6 +1096,11 @@ func convertMapInterface(m map[string]string) map[string]interface{} {
 // Passing `trapConfig` parameter so each instance can handle its own traps independently.
 func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		// Record what is actually sent (status, bytes, hash) so the log line
+		// can carry the response side of the exchange.
+		rr := newResponseRecorder(w)
+		w = rr
 		// Count the request once against its connection, for Keep-Alive max.
 		r = r.WithContext(context.WithValue(r.Context(), reqNumKey{}, requestNumber(r)))
 		ua := uaParser.Parse(r.Header.Get("User-Agent"))
@@ -1122,7 +1127,9 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 		route := routeExact
 		if !ok {
 			if fallback == nil {
-				logDetails(buildLogDetails(r, ua, payload, false))
+				details := buildLogDetails(r, ua, payload, false)
+				mergeDetails(details, responseDetails(rr, rr.Header(), "none", started, 0))
+				logDetails(details)
 				return
 			}
 			trap, behaviour, route = methodFallback(currentMethods(), trapConfig, r, payload)
@@ -1139,10 +1146,20 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 				details["trapped_references"] = trap.Basicinfo.References
 			}
 		}
-		logDetails(details)
-		phpDelay(r, behaviour.Response, bodyLen)
+		// The line is written after the response so it records what the
+		// client actually received.
+		delay := phpDelay(r, behaviour.Response, bodyLen)
 		writeTrapResponse(w, r, behaviour)
+		mergeDetails(details, responseDetails(rr, rr.Header(), responseSource(behaviour, route), started, delay))
+		logDetails(details)
 	})
+}
+
+// mergeDetails copies src into dst.
+func mergeDetails(dst, src map[string]string) {
+	for k, v := range src {
+		dst[k] = v
+	}
 }
 
 func newTrapRouter(trapConfig []Trap, catchall bool) *mux.Router {
