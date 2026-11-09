@@ -966,7 +966,14 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 		case strings.EqualFold(key, "Set-Cookie"):
 			w.Header().Add("Set-Cookie", render(value)) // never wipe a conditional cookie added earlier
 		default:
-			w.Header().Set(key, render(value))
+			// Preserve the trap's exact header-name casing. A real appliance's
+			// casing (e.g. X-XSS-Protection, ETag, X-FRAME-OPTIONS) differs from
+			// Go's canonical form (X-Xss-Protection, Etag, X-Frame-Options), and
+			// Header.Set would canonicalize it. Assigning the header map directly
+			// makes net/http write the key verbatim. Content-Type/Content-Length
+			// are handled specially by net/http via their canonical keys, which
+			// the traps already write canonically, so framing is unaffected.
+			w.Header()[key] = []string{render(value)}
 		}
 	}
 	statusCode := behaviour.Response.Statuscode

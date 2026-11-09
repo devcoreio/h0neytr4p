@@ -644,3 +644,57 @@ func TestServerKeepAliveStyleHTTP10WithoutTokenCloses(t *testing.T) {
 		t.Errorf("Connection = %q, want close", got)
 	}
 }
+
+// --- B004 GlobalProtect: verbatim header-name casing ---
+
+// rawResponseBytes sends one request on a fresh connection and returns the raw
+// response text (http.ReadResponse would canonicalize header names, hiding the
+// casing we are testing).
+func rawResponseBytes(t *testing.T, addr, req string) string {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(conn)
+	return string(b)
+}
+
+// A trap's header-name casing must reach the wire verbatim: a real PAN-OS
+// gateway serves X-XSS-Protection, ETag and (on /sslmgr) X-FRAME-OPTIONS, whose
+// casing differs from Go's canonical X-Xss-Protection / Etag / X-Frame-Options.
+// Upstream (Header.Set) canonicalizes and this test fails there.
+func TestServerPreservesHeaderNameCasing(t *testing.T) {
+	configureTestIO(t)
+	SetFallback(testFallback())
+	t.Cleanup(func() { SetFallback(nil) })
+	trap := Trap{
+		Basicinfo: BasicInfo{Name: "casing", Port: "80"},
+		Behaviour: []Behaviour{{
+			Request: Request{URL: "/x", Method: http.MethodGet, Headers: map[string]interface{}{}, Params: map[string]interface{}{}},
+			Response: Response{Statuscode: 200, Type: "string", Body: "ok", Headers: map[string]interface{}{
+				"Content-Type":     "text/plain",
+				"X-XSS-Protection": "1; mode=block",
+				"ETag":             "\"abc\"",
+				"X-FRAME-OPTIONS":  "DENY",
+			}},
+		}},
+	}
+	addr := strings.TrimPrefix(startServer(t, []Trap{trap}).URL, "http://")
+	raw := rawResponseBytes(t, addr, "GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	for _, want := range []string{"X-XSS-Protection:", "ETag:", "X-FRAME-OPTIONS:"} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("response missing verbatim header %q; raw:\n%s", want, raw)
+		}
+	}
+	for _, bad := range []string{"X-Xss-Protection:", "Etag:", "X-Frame-Options:"} {
+		if strings.Contains(raw, bad) {
+			t.Errorf("response canonicalized header to %q (casing not preserved)", bad)
+		}
+	}
+}
