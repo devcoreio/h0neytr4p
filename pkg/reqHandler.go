@@ -794,6 +794,10 @@ func wantsKeepAlive(h http.Header) bool {
 // Apache answers Connection: close with no Keep-Alive header and closes; Go
 // closes the connection when the handler sets Connection: close.
 func applyApacheConnectionHeaders(w http.ResponseWriter, r *http.Request, n int32, bodyLen int) {
+	if currentConnStyle() == connStyleKeepAlive {
+		applyKeepAliveConnectionHeaders(w, r)
+		return
+	}
 	h := w.Header()
 	if n > maxKeepAliveRequests {
 		h.Set("Connection", "close")
@@ -810,6 +814,39 @@ func applyApacheConnectionHeaders(w http.ResponseWriter, r *http.Request, n int3
 	if !r.ProtoAtLeast(1, 1) {
 		h.Set("Connection", "close")
 	}
+}
+
+// connectionHasClose reports whether the client's Connection header carries a
+// close token.
+func connectionHasClose(h http.Header) bool {
+	for _, v := range h.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "close") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// applyKeepAliveConnectionHeaders shapes the connection headers the way an
+// nginx-style appliance (PAN-OS GlobalProtect) does: it adds
+// "Connection: keep-alive" to every persistent response unconditionally
+// (unlike Apache, which only echoes it when the client asked), never emits a
+// Keep-Alive header, and never synthesises a Content-Length (GP sets its own
+// on every response). An HTTP/1.0 client that did not ask for keep-alive, or
+// any client that asked to close, gets "Connection: close".
+func applyKeepAliveConnectionHeaders(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	if connectionHasClose(r.Header) {
+		h.Set("Connection", "close")
+		return
+	}
+	if r.ProtoAtLeast(1, 1) || wantsKeepAlive(r.Header) {
+		h.Set("Connection", "keep-alive")
+		return
+	}
+	h.Set("Connection", "close")
 }
 
 // isPHPResponse reports whether a response is one PHP would have generated:

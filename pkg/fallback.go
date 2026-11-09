@@ -15,7 +15,21 @@ type Fallback struct {
 	Unmatched Response      `json:"Unmatched"`
 	Timing    Timing        `json:"Timing"`
 	Methods   *MethodPolicy `json:"Methods,omitempty"`
+	// ConnStyle selects how connection-management headers are shaped, so a
+	// persona that is not Apache does not leak Apache's Keep-Alive header.
+	// "" or "apache" keep the Apache 2.4 behaviour (Keep-Alive + Connection
+	// only when the client asked). "keepalive" is the nginx/appliance style
+	// used by PAN-OS GlobalProtect: Connection: keep-alive on every HTTP/1.1
+	// persistent response with no Keep-Alive header and no synthetic
+	// Content-Length. See applyApacheConnectionHeaders.
+	ConnStyle string `json:"ConnectionStyle,omitempty"`
 }
+
+// Connection-header styles for Fallback.ConnStyle.
+const (
+	connStyleApache    = "apache"
+	connStyleKeepAlive = "keepalive"
+)
 
 // MethodPolicy is how Apache answers a method no trap matched. mod_php runs
 // any verb but TRACE on a PHP path (handled by the relaxed trap pass); on a
@@ -114,8 +128,21 @@ func LoadFallback(path string) (*Fallback, error) {
 	if err := validateMethods(fb.Methods); err != nil {
 		return nil, fmt.Errorf("fallback %s: %w", path, err)
 	}
+	if err := validateConnStyle(fb.ConnStyle); err != nil {
+		return nil, fmt.Errorf("fallback %s: %w", path, err)
+	}
 	SetFallback(fb)
 	return fb, nil
+}
+
+// validateConnStyle rejects a ConnectionStyle the handler does not know, so a
+// typo fails at load instead of silently falling back to Apache headers.
+func validateConnStyle(style string) error {
+	switch style {
+	case "", connStyleApache, connStyleKeepAlive:
+		return nil
+	}
+	return fmt.Errorf("ConnectionStyle %q is not one of %q, %q", style, connStyleApache, connStyleKeepAlive)
 }
 
 // validateFallbackResponse fails fast on mistakes that would otherwise turn
@@ -179,6 +206,15 @@ func currentTiming() Timing {
 		return Timing{}
 	}
 	return fallback.Timing
+}
+
+// currentConnStyle returns the loaded fallback's connection-header style, or
+// "" (Apache behaviour) when no fallback is installed.
+func currentConnStyle() string {
+	if fallback == nil {
+		return ""
+	}
+	return fallback.ConnStyle
 }
 
 // SetFallback installs (or, with nil, removes) the package fallback.

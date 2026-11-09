@@ -269,3 +269,42 @@ func TestLoadFallbackRejectsBadMethods(t *testing.T) {
 		})
 	}
 }
+
+// --- B004 GlobalProtect: ConnectionStyle ---
+
+func TestLoadFallbackParsesConnectionStyle(t *testing.T) {
+	SetFallback(nil)
+	t.Cleanup(func() { SetFallback(nil) })
+	path := writeFallbackFile(t, `{"Unmatched":{"StatusCode":404,"Type":"string","Body":"x","Headers":{"Content-Type":"text/html"}},"ConnectionStyle":"keepalive"}`)
+	fb, err := LoadFallback(path)
+	if err != nil {
+		t.Fatalf("LoadFallback() error = %v", err)
+	}
+	if fb.ConnStyle != connStyleKeepAlive {
+		t.Errorf("ConnStyle = %q, want %q", fb.ConnStyle, connStyleKeepAlive)
+	}
+	if currentConnStyle() != connStyleKeepAlive {
+		t.Errorf("currentConnStyle() = %q, want %q", currentConnStyle(), connStyleKeepAlive)
+	}
+}
+
+func TestLoadFallbackConnectionStyleOptional(t *testing.T) {
+	SetFallback(nil)
+	t.Cleanup(func() { SetFallback(nil) })
+	path := writeFallbackFile(t, `{"Unmatched":{"StatusCode":404,"Type":"string","Body":"x","Headers":{"Content-Type":"text/html"}}}`)
+	fb, err := LoadFallback(path)
+	if err != nil {
+		t.Fatalf("LoadFallback() error = %v", err)
+	}
+	if fb.ConnStyle != "" {
+		t.Errorf("ConnStyle = %q, want empty (Apache default)", fb.ConnStyle)
+	}
+}
+
+func TestLoadFallbackRejectsUnknownConnectionStyle(t *testing.T) {
+	t.Cleanup(func() { SetFallback(nil) })
+	path := writeFallbackFile(t, `{"Unmatched":{"StatusCode":404,"Type":"string","Body":"x","Headers":{"Content-Type":"text/html"}},"ConnectionStyle":"nginx-ish"}`)
+	if _, err := LoadFallback(path); err == nil {
+		t.Fatal("LoadFallback accepted an unknown ConnectionStyle")
+	}
+}

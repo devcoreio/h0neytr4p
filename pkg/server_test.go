@@ -585,3 +585,62 @@ func TestServerPHPResponseIsDelayedStaticIsNot(t *testing.T) {
 		t.Fatalf("static 404 answered in %v, want < 40ms (no X-Powered-By, no delay)", elapsed)
 	}
 }
+
+// --- B004 GlobalProtect: nginx/appliance connection-header style ---
+
+func startKeepAliveStyleServer(t *testing.T) string {
+	t.Helper()
+	configureTestIO(t)
+	fb := testFallback()
+	fb.ConnStyle = connStyleKeepAlive
+	SetFallback(fb)
+	t.Cleanup(func() { SetFallback(nil) })
+	return strings.TrimPrefix(startServer(t, []Trap{loginTrap()}).URL, "http://")
+}
+
+// A GlobalProtect-style (nginx) persona adds "Connection: keep-alive" to every
+// HTTP/1.1 persistent response and never emits a Keep-Alive header, even when
+// the client sent no Connection token or an unknown one. That no-token case is
+// exactly where the Apache style sends neither header
+// (TestServerNoKeepAliveHeadersWithoutToken), so this is the behaviour that
+// distinguishes the GP persona and matches the real PAN-OS 11.1.6 capture (B004).
+func TestServerKeepAliveStyleAlwaysSendsPlainKeepAlive(t *testing.T) {
+	addr := startKeepAliveStyleServer(t)
+	for _, connection := range []string{"keep-alive", "", "xxxxx"} {
+		resp := rawExchange(t, addr, rawRequest("GET", "/login/index.php", "HTTP/1.1", connection))[0]
+		if got := resp.Header.Get("Connection"); got != "keep-alive" {
+			t.Errorf("Connection %q: Connection header = %q, want keep-alive", connection, got)
+		}
+		if got := resp.Header.Get("Keep-Alive"); got != "" {
+			t.Errorf("Connection %q: Keep-Alive header = %q, want none", connection, got)
+		}
+	}
+}
+
+// A client that explicitly asks to close must not be told keep-alive: the
+// connection closes and no Keep-Alive header is emitted. (The literal
+// Connection header value on an HTTP/1.1 close is managed by net/http itself,
+// so the robust assertion is resp.Close plus the absence of Keep-Alive.)
+func TestServerKeepAliveStyleHonoursClose(t *testing.T) {
+	addr := startKeepAliveStyleServer(t)
+	resp := rawExchange(t, addr, rawRequest("GET", "/login/index.php", "HTTP/1.1", "close"))[0]
+	if !resp.Close {
+		t.Errorf("resp.Close = false, want true (client asked to close)")
+	}
+	if got := resp.Header.Get("Connection"); got == "keep-alive" {
+		t.Errorf("Connection = %q, want not keep-alive", got)
+	}
+	if got := resp.Header.Get("Keep-Alive"); got != "" {
+		t.Errorf("Keep-Alive = %q, want none", got)
+	}
+}
+
+// An HTTP/1.0 client that did not ask for keep-alive gets Connection: close,
+// as a real server would.
+func TestServerKeepAliveStyleHTTP10WithoutTokenCloses(t *testing.T) {
+	addr := startKeepAliveStyleServer(t)
+	resp := rawExchange(t, addr, rawRequest("GET", "/login/index.php", "HTTP/1.0", ""))[0]
+	if got := resp.Header.Get("Connection"); got != "close" {
+		t.Errorf("Connection = %q, want close", got)
+	}
+}
