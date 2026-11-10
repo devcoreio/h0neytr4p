@@ -838,6 +838,12 @@ func connectionHasClose(h http.Header) bool {
 // any client that asked to close, gets "Connection: close".
 func applyKeepAliveConnectionHeaders(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
+	// A trap that sets Connection: close keeps it: nginx closes after some
+	// responses (400, a refused TRACE) whatever the client asked for, and
+	// net/http closes the connection when the handler sets the header.
+	if strings.EqualFold(h.Get("Connection"), "close") {
+		return
+	}
 	if connectionHasClose(r.Header) {
 		h.Set("Connection", "close")
 		return

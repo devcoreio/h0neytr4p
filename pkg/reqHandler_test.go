@@ -1060,3 +1060,25 @@ func TestWriteTrapResponseCookieOrderIsStable(t *testing.T) {
 		}
 	}
 }
+
+func TestKeepAliveStyleKeepsTrapConnectionClose(t *testing.T) {
+	prev := fallback
+	SetFallback(&Fallback{ConnStyle: connStyleKeepAlive})
+	defer SetFallback(prev)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Connection", "keep-alive")
+
+	closing := Behaviour{Response: Response{Statuscode: 400, Body: "x", Headers: map[string]interface{}{"Connection": "close"}}}
+	rec := httptest.NewRecorder()
+	writeTrapResponse(rec, req, closing)
+	if got := rec.Header().Get("Connection"); got != "close" {
+		t.Fatalf("trap set Connection: close, response has %q", got)
+	}
+
+	plain := Behaviour{Response: Response{Statuscode: 200, Body: "x"}}
+	rec = httptest.NewRecorder()
+	writeTrapResponse(rec, req, plain)
+	if got := rec.Header().Get("Connection"); got != "keep-alive" {
+		t.Fatalf("no trap Connection header: response has %q, want keep-alive", got)
+	}
+}
