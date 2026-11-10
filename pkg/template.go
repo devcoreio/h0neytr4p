@@ -21,9 +21,13 @@ import (
 //	{{sid}}           26 chars of [0-9a-v] (PHP 8.3 default session id)
 //	{{rand_hex:N}}    N lowercase hex chars
 //	{{rand_alnum:N}}  N chars of [A-Za-z0-9]
+//	{{http_date}}     the current time as an HTTP date (RFC 7231 IMF-fixdate)
+//	{{http_date:+N}}  the same, N seconds ahead ({{http_date:-N}} behind), for
+//	                  headers a real server computes per response, such as
+//	                  nginx's "expires 10d" Expires header or a cookie expiry
 //
 // Unknown tokens are left untouched.
-var templateToken = regexp.MustCompile(`\{\{(sid|rand_hex:\d+|rand_alnum:\d+)\}\}`)
+var templateToken = regexp.MustCompile(`\{\{(sid|rand_hex:\d+|rand_alnum:\d+|http_date(?::[+-]\d+)?)\}\}`)
 
 const (
 	sidAlphabet   = "0123456789abcdefghijklmnopqrstuv"
@@ -72,6 +76,11 @@ func RenderTemplate(s string) string {
 		case strings.HasPrefix(inner, "rand_alnum:"):
 			n, _ := strconv.Atoi(strings.TrimPrefix(inner, "rand_alnum:"))
 			return randomString(alnumAlphabet, n)
+		case inner == "http_date":
+			return time.Now().UTC().Format(http.TimeFormat)
+		case strings.HasPrefix(inner, "http_date:"):
+			n, _ := strconv.Atoi(strings.TrimPrefix(inner, "http_date:"))
+			return time.Now().UTC().Add(time.Duration(n) * time.Second).Format(http.TimeFormat)
 		}
 		return tok
 	})

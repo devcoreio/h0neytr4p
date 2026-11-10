@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRenderTemplateSid(t *testing.T) {
@@ -174,5 +175,34 @@ func TestRenderRequestTemplateMethod(t *testing.T) {
 	got := RenderRequestTemplate("<p>{{req_method}} not supported for current URL.<br />", r)
 	if want := "<p>DOOD not supported for current URL.<br />"; got != want {
 		t.Fatalf("RenderRequestTemplate = %q, want %q", got, want)
+	}
+}
+
+func TestRenderTemplateHTTPDate(t *testing.T) {
+	now := time.Now().UTC()
+	parse := func(s string) time.Time {
+		t.Helper()
+		v, err := time.Parse(http.TimeFormat, s)
+		if err != nil {
+			t.Fatalf("%q is not an HTTP date: %v", s, err)
+		}
+		return v
+	}
+	if d := parse(RenderTemplate("{{http_date}}")).Sub(now); d < -2*time.Second || d > 2*time.Second {
+		t.Fatalf("http_date is %v away from now", d)
+	}
+	if d := parse(RenderTemplate("{{http_date:+864000}}")).Sub(now); d < 863998*time.Second || d > 864002*time.Second {
+		t.Fatalf("http_date:+864000 is %v ahead, want ~240h", d)
+	}
+	if d := parse(RenderTemplate("{{http_date:-60}}")).Sub(now); d > -58*time.Second || d < -62*time.Second {
+		t.Fatalf("http_date:-60 is %v, want ~-1m", d)
+	}
+	// A cookie attribute keeps its surrounding text; an unknown variant is left alone.
+	got := RenderTemplate("GP_SESSION_CK=; Path=/; Expires={{http_date}}; HttpOnly")
+	if !strings.HasPrefix(got, "GP_SESSION_CK=; Path=/; Expires=") || !strings.HasSuffix(got, " GMT; HttpOnly") {
+		t.Fatalf("cookie rendering = %q", got)
+	}
+	if got := RenderTemplate("{{http_date:tomorrow}}"); got != "{{http_date:tomorrow}}" {
+		t.Fatalf("unknown token rewritten: %q", got)
 	}
 }
