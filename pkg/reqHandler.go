@@ -954,7 +954,17 @@ func writeTrapResponse(w http.ResponseWriter, r *http.Request, behaviour Behavio
 	if bytes.Contains(body, []byte("{{")) {
 		body = []byte(render(string(body)))
 	}
-	for key, value := range convertMap(behaviour.Response.Headers) {
+	// Sorted, so a response that sets several cookies (Set-Cookie plus
+	// Set-Cookie-If-Missing-01, -02, ...) emits them in the same order every
+	// time, as a real server does, instead of in Go's random map order.
+	headers := convertMap(behaviour.Response.Headers)
+	headerKeys := make([]string, 0, len(headers))
+	for key := range headers {
+		headerKeys = append(headerKeys, key)
+	}
+	sort.Strings(headerKeys)
+	for _, key := range headerKeys {
+		value := headers[key]
 		switch {
 		// "Set-Cookie-If-Missing" or "Set-Cookie-If-Missing-<anything>": one
 		// conditional cookie per key, so a response can set several.

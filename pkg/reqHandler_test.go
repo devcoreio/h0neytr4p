@@ -1042,3 +1042,21 @@ func TestReparsePrefixParamsEmptyOnHeaderFlood(t *testing.T) {
 		t.Fatalf("variant A should recover nothing, got %#v", got)
 	}
 }
+
+func TestWriteTrapResponseCookieOrderIsStable(t *testing.T) {
+	behaviour := Behaviour{Response: Response{Statuscode: 200, Body: "x", Headers: map[string]interface{}{
+		"Set-Cookie-If-Missing-03": "C=; Path=/",
+		"Set-Cookie-If-Missing-01": "A=; Path=/",
+		"Set-Cookie-If-Missing-02": "B=; Path=/",
+		"Set-Cookie-If-Missing-04": "D=; Path=/",
+		"Set-Cookie-If-Missing-05": "E=; Path=/",
+	}}}
+	for i := 0; i < 50; i++ {
+		rec := httptest.NewRecorder()
+		writeTrapResponse(rec, httptest.NewRequest(http.MethodGet, "/", nil), behaviour)
+		got := strings.Join(rec.Header().Values("Set-Cookie"), "|")
+		if want := "A=; Path=/|B=; Path=/|C=; Path=/|D=; Path=/|E=; Path=/"; got != want {
+			t.Fatalf("run %d: cookie order = %q, want %q", i, got, want)
+		}
+	}
+}
