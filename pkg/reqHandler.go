@@ -1023,7 +1023,39 @@ const (
 	routeTrace          = "trace"           // 405 with an empty Allow, any path
 	routeOptions        = "options"         // 200 Allow on a non-PHP path
 	routeUnmatched      = "unmatched"
+	routeMissingHost    = "missing-host" // 400: no Host header (Fallback.RejectMissingHost)
 )
+
+const missingHostText = "400 Bad Request: missing required Host header"
+
+// writeMissingHost refuses a request that carries no Host header the way a
+// Go reverse proxy does: the reason is in the status line and repeated as a
+// text/plain body, and the connection closes. net/http cannot write a custom
+// reason phrase, so the response is written on the hijacked connection; the
+// recorder still sees the status and size for the log line.
+func writeMissingHost(w http.ResponseWriter, r *http.Request) {
+	raw := "HTTP/1.1 " + missingHostText + "\r\n" +
+		"Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"Connection: close\r\n\r\n" + missingHostText
+	if rr, ok := w.(*responseRecorder); ok {
+		rr.status = http.StatusBadRequest
+		rr.bytes = int64(len(missingHostText))
+		w = rr.ResponseWriter
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, missingHostText, http.StatusBadRequest)
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	buf.WriteString(raw)
+	buf.Flush()
+}
 
 // firstMatch returns the first behaviour whose method (as given), URL,
 // proto, headers and params all match the request. phpOnly limits it to
@@ -1183,6 +1215,17 @@ func allHandler(trapConfig []Trap, catchall bool) http.Handler {
 		drainBody(r.Body, MaxDrainSize)
 		bodyLen := requestBodyLength(r, body.n)
 
+		// The HTTP/2 preface (PRI * HTTP/2.0) has no Host by definition and is
+		// refused earlier in a real front end; leave it to the traps.
+		if r.Host == "" && r.Method != "PRI" && rejectMissingHost() {
+			details := buildLogDetails(r, ua, payload, false)
+			details["method_route"] = routeMissingHost
+			writeMissingHost(rr, r)
+			mergeDetails(details, responseDetails(rr, rr.Header(), "builtin:missing-host", started, 0))
+			logDetails(details)
+			return
+		}
+
 		trap, behaviour, ok := firstMatch(trapConfig, r, payload, r.Method, false)
 		route := routeExact
 		if !ok {
@@ -1271,7 +1314,9 @@ func StartHandler(port string, trapConfig []Trap, cert string, key string, catch
 	server := newServer(port, r)
 
 	var err error
-	if port == "443" {
+	if port == "443" && noALPN() {
+		err = serveTLSWithoutALPN(server, cert, key)
+	} else if port == "443" {
 		err = server.ListenAndServeTLS(cert, key)
 	} else {
 		err = server.ListenAndServe()
@@ -1280,4 +1325,28 @@ func StartHandler(port string, trapConfig []Trap, cert string, key string, catch
 		return err
 	}
 	return nil
+}
+
+// serveTLSWithoutALPN serves HTTPS on a TLS listener built here rather than
+// by net/http, whose ListenAndServeTLS always adds "http/1.1" to the offered
+// protocols. With no NextProtos the server answers a ClientHello's ALPN
+// extension with none, as an appliance that does not do ALPN does.
+func serveTLSWithoutALPN(server *http.Server, certFile, keyFile string) error {
+	ln, err := newTLSListenerWithoutALPN(server.Addr, certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	return server.Serve(ln)
+}
+
+func newTLSListenerWithoutALPN(addr, certFile, keyFile string) (net.Listener, error) {
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{pair}}), nil
 }

@@ -23,6 +23,16 @@ type Fallback struct {
 	// persistent response with no Keep-Alive header and no synthetic
 	// Content-Length. See applyApacheConnectionHeaders.
 	ConnStyle string `json:"ConnectionStyle,omitempty"`
+	// NoALPN makes the TLS listener negotiate no application protocol.
+	// net/http's own TLS listener always offers "http/1.1"; an appliance
+	// front end that does no ALPN (PAN-OS GlobalProtect) answers a client's
+	// ALPN extension with none.
+	NoALPN bool `json:"NoALPN,omitempty"`
+	// RejectMissingHost answers a request that has no Host header with
+	// "400 Bad Request: missing required Host header", the way a Go reverse
+	// proxy in front of the application does. net/http already does this for
+	// HTTP/1.1; this extends it to HTTP/1.0, which net/http lets through.
+	RejectMissingHost bool `json:"RejectMissingHost,omitempty"`
 }
 
 // Connection-header styles for Fallback.ConnStyle.
@@ -220,4 +230,14 @@ func currentConnStyle() string {
 // SetFallback installs (or, with nil, removes) the package fallback.
 func SetFallback(f *Fallback) {
 	fallback = f
+}
+
+// noALPN reports whether the loaded fallback turns ALPN off.
+func noALPN() bool {
+	return fallback != nil && fallback.NoALPN
+}
+
+// rejectMissingHost reports whether a request without a Host header is refused.
+func rejectMissingHost() bool {
+	return fallback != nil && fallback.RejectMissingHost
 }
